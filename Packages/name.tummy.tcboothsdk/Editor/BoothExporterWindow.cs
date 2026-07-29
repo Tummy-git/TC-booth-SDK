@@ -46,7 +46,7 @@ public class BoothExporterWindow : EditorWindow
         
         EditorGUILayout.Space();
 
-        // --- NEW CREATOR TOOLS SECTION ---
+        // --- CREATOR TOOLS SECTION ---
         GUILayout.Label("Creator Tools", EditorStyles.boldLabel);
         if (GUILayout.Button("Spawn Booth Reference Area", GUILayout.Height(30)))
         {
@@ -93,7 +93,7 @@ public class BoothExporterWindow : EditorWindow
         string terms = "By uploading your virtual booth, you agree to the following:\n\n" +
                        "1. You hold the rights or licenses for all assets included.\n" +
                        "2. You are responsible for the performance and compatibility of your booth.\n" +
-                       "3. Tummy reserves the right to remove any booth that violates community guidelines or perfromes really bad.\n\n" +
+                       "3. The organizers reserve the right to remove any booth that violates community guidelines or performs poorly.\n\n" +
                        "Please review the full documentation provided by the admin team.";
                        
         EditorUtility.DisplayDialog("Terms & Conditions", terms, "I Agree", "Close");
@@ -106,8 +106,9 @@ public class BoothExporterWindow : EditorWindow
                         $"All your assets must be placed inside 'Assets/{ROOT_FOLDER}/[YourUsername]/'.\n" +
                         "If you place files outside this folder, the SDK will reject the export.\n\n" +
                         "2. LOGIC & SHADERS:\n" +
-                        "Custom scripts and shaders are permitted. You are responsible for their stability. Any booth causing crashes or performance issues will be removed.\n\n" +
-                        "If you use Poiyomi shaders etc. Locking in .\n\n" +
+                        "Custom scripts and shaders are permitted. You are responsible for their stability. Any booth causing crashes or performance issues will be removed.\n" +
+                        "Easiest is to use shaders in VPM packages. Make sure to send a link to the VPM my way so I can add it.\n" +
+                        "If you use Poiyomi shaders. Locking in is the way to do it.\n\n" +
                         "3. EXPORT PROCESS:\n" +
                         "- Ensure your booth is an active GameObject with a 'BoothDescriptor' component. Fill in your VRC user name and the name of the booth.\n" +
                         "- Make sure the ConBoothArea prefab isn't part of your booth. It's just there for reference.\n" +
@@ -137,16 +138,17 @@ public class BoothExporterWindow : EditorWindow
             return;
         }
 
-        // --- PATH LOGIC WITH DYNAMIC PREFAB NAMING ---
         string safeUsername = string.Join("_", serverUsername.Split(Path.GetInvalidFileNameChars()));
         string userRootFolder = $"Assets/{ROOT_FOLDER}/{safeUsername}";
         
-        // Extract descriptor info and sanitize to prevent OS path errors
         string rawPrefabName = $"{descriptor.creatorName} - {descriptor.boothName}";
         string safePrefabName = string.Join("_", rawPrefabName.Split(Path.GetInvalidFileNameChars()));
         string prefabPath = $"{userRootFolder}/{safePrefabName}.prefab";
         
         string exportFolderPath = "Temp/BoothPackages";
+        
+        // VPM Manifest Path
+        string manifestDestPath = $"{userRootFolder}/{safePrefabName}_VPM.json";
 
         try
         {
@@ -169,6 +171,14 @@ public class BoothExporterWindow : EditorWindow
                 return;
             }
 
+            // --- INJECT VPM MANIFEST ---
+            string vpmManifestSrc = "Packages/vpm-manifest.json";
+            if (File.Exists(vpmManifestSrc))
+            {
+                File.Copy(vpmManifestSrc, manifestDestPath, true);
+                AssetDatabase.ImportAsset(manifestDestPath, ImportAssetOptions.ForceUpdate);
+            }
+
             if (!Directory.Exists(exportFolderPath)) Directory.CreateDirectory(exportFolderPath);
             string packageFilePath = Path.Combine(exportFolderPath, "booth_package.unitypackage");
 
@@ -179,13 +189,14 @@ public class BoothExporterWindow : EditorWindow
 
             foreach (string dep in rawDependencies)
             {
-                // Skip the descriptor script so it is NOT packaged
-                if (dep.Contains("BoothDescriptor.cs")) continue;
+                if (ShouldSkipDependency(dep)) continue;
+                if (dep.StartsWith("Assets/")) filteredDependencies.Add(dep);
+            }
 
-                if (dep.StartsWith("Assets/"))
-                {
-                    filteredDependencies.Add(dep);
-                }
+            // Force the injected manifest into the package
+            if (File.Exists(manifestDestPath) && !filteredDependencies.Contains(manifestDestPath))
+            {
+                filteredDependencies.Add(manifestDestPath);
             }
 
             EditorUtility.DisplayProgressBar("Booth Exporter", "Packaging filtered assets...", 0.5f);
@@ -207,10 +218,37 @@ public class BoothExporterWindow : EditorWindow
         }
         finally
         {
+            // Clean up the temporary VPM file so the user's project stays clean
+            if (File.Exists(manifestDestPath))
+            {
+                AssetDatabase.DeleteAsset(manifestDestPath);
+            }
+            
             EditorUtility.ClearProgressBar();
             if (Directory.Exists(exportFolderPath)) Directory.Delete(exportFolderPath, true);
             AssetDatabase.Refresh();
         }
+    }
+
+    private bool ShouldSkipDependency(string dep)
+    {
+        string[] skipPrefixes = new string[] 
+        {
+            "Packages/",
+            "Resources/",
+            "Assets/TextMesh Pro/",
+            "Assets/SerializedUdonPrograms/"
+        };
+
+        foreach (string prefix in skipPrefixes)
+        {
+            if (dep.StartsWith(prefix)) return true;
+        }
+
+        if (dep.Contains("BoothDescriptor.cs")) return true;
+        if (dep.EndsWith("_VPM.json")) return true; // Handled manually
+
+        return false;
     }
 
     private bool ValidateComponents(GameObject rootObject, out string errorMessage)
@@ -244,10 +282,7 @@ public class BoothExporterWindow : EditorWindow
 
         foreach (string dep in rawDependencies)
         {
-            // Ignore descriptor script specifically
-            if (dep.Contains("BoothDescriptor.cs")) continue;
-
-            if (dep.StartsWith("Resources/") || dep.StartsWith("Packages/")) continue; 
+            if (ShouldSkipDependency(dep)) continue; 
 
             if (dep.StartsWith("Assets/"))
             {
@@ -288,14 +323,12 @@ public class BoothExporterWindow : EditorWindow
     
     private void SpawnReferencePrefab()
     {
-        // 1. Prevent accidental duplicate spawning
         if (GameObject.Find("ConBoothArea") != null || GameObject.Find("ConBoothArea(Clone)") != null)
         {
             EditorUtility.DisplayDialog("Already Exists", "The reference area is already present in your scene.", "OK");
             return;
         }
 
-        // 2. Search the entire project (including VPM packages) for the prefab
         string[] guids = AssetDatabase.FindAssets("ConBoothArea t:Prefab");
         
         if (guids.Length == 0)
@@ -304,24 +337,15 @@ public class BoothExporterWindow : EditorWindow
             return;
         }
 
-        // 3. Load and safely instantiate the prefab to maintain its connection
         string assetPath = AssetDatabase.GUIDToAssetPath(guids[0]);
         GameObject prefabAsset = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
 
         if (prefabAsset != null)
         {
             GameObject instance = (GameObject)PrefabUtility.InstantiatePrefab(prefabAsset);
-            
-            // Clean up the name so it doesn't say "(Clone)"
             instance.name = "ConBoothArea"; 
-
-            // Select it and focus the scene camera on it for good UX
             Selection.activeGameObject = instance;
-            if (SceneView.lastActiveSceneView != null)
-            {
-                SceneView.lastActiveSceneView.FrameSelected();
-            }
-            
+            if (SceneView.lastActiveSceneView != null) SceneView.lastActiveSceneView.FrameSelected();
             Debug.Log("[Booth SDK] Reference area spawned successfully.");
         }
     }
