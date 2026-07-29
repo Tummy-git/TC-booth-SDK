@@ -1,0 +1,18 @@
+{
+  "name": "name.tummy.tcboothsdk",
+  "displayName": "TummyCon booth SDK",
+  "version": "0.0.1",
+  "description": "This package contains the TummyCon booth uploader.",
+  "gitDependencies": {},
+  "vpmDependencies": {
+    "com.vrchat.worlds": "3.10.4"
+  },
+  "author": {
+    "name": "tummy",
+    "email": "mail@tummy.name",
+    "url": "https://github.com/Tummy-git"
+  },
+  "legacyFolders": {},
+  "legacyFiles": {},
+  "localPath": "E:\\github_root\\TC-booth-SDK\\Packages\\name.tummy.tcboothsdk"
+}
