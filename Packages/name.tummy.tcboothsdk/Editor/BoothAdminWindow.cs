@@ -10,7 +10,6 @@ public class BoothAdminWindow : EditorWindow
     private Dictionary<string, List<string>> missingPackagesPerBooth = new Dictionary<string, List<string>>();
     private Vector2 scrollPos;
 
-    // --- CHANGED: Moved from "Booth Admin" to "Booth SDK" ---
     [MenuItem("Booth SDK/Admin/Check VPM Dependencies")]
     public static void ShowWindow()
     {
@@ -145,20 +144,5 @@ public class BoothAdminWindow : EditorWindow
             }
         }
         return packages;
-    }
-}
-
-public class BoothImportDetector : AssetPostprocessor
-{
-    static void OnPostprocessAllAssets(string[] importedAssets, string[] deletedAssets, string[] movedAssets, string[] movedFromAssetPaths)
-    {
-        foreach (string path in importedAssets)
-        {
-            if (path.EndsWith("_VPM.json"))
-            {
-                BoothAdminWindow.ShowWindow();
-                break;
-            }
-        }
     }
 }

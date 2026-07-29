@@ -9,10 +9,12 @@ public class BoothExporterWindow : EditorWindow
 {
     private string serverUsername = "";
     private string serverPassword = "";
-    private const string ServerEndpoint = "https://upload.tummy.name/upload-booth"; 
-    private const string BackupFolderName = "BoothExports";
     
-    // Unified root folder name
+    private const string ServerBaseUrl = "https://upload.tummy.name";
+    private const string ServerEndpoint = ServerBaseUrl + "/upload-booth"; 
+    private const string LimitsEndpoint = ServerBaseUrl + "/api/limits"; 
+    
+    private const string BackupFolderName = "BoothExports";
     private const string ROOT_FOLDER = "Booth"; 
 
     private const string PrefKey_User = "BoothSDK_Username";
@@ -146,8 +148,6 @@ public class BoothExporterWindow : EditorWindow
         string prefabPath = $"{userRootFolder}/{safePrefabName}.prefab";
         
         string exportFolderPath = "Temp/BoothPackages";
-        
-        // VPM Manifest Path
         string manifestDestPath = $"{userRootFolder}/{safePrefabName}_VPM.json";
 
         try
@@ -186,7 +186,7 @@ public class BoothExporterWindow : EditorWindow
             
             string[] rawDependencies = AssetDatabase.GetDependencies(prefabPath, true);
             List<string> filteredDependencies = new List<string>();
-            List<string> shaderDebugList = new List<string>(); // NEW: Track shaders for logs
+            List<string> shaderDebugList = new List<string>(); 
 
             foreach (string dep in rawDependencies)
             {
@@ -195,7 +195,6 @@ public class BoothExporterWindow : EditorWindow
                 {
                     filteredDependencies.Add(dep);
                     
-                    // NEW: Log if it is a custom shader file or include
                     if (dep.EndsWith(".shader") || dep.EndsWith(".cginc") || dep.EndsWith(".hlsl"))
                     {
                         shaderDebugList.Add(dep);
@@ -203,13 +202,11 @@ public class BoothExporterWindow : EditorWindow
                 }
             }
 
-            // NEW: Print the results to the Unity Console
             if (shaderDebugList.Count > 0)
             {
                 Debug.Log($"[Booth SDK] Bundling {shaderDebugList.Count} custom shader files:\n" + string.Join("\n", shaderDebugList));
             }
 
-            // Force the injected manifest into the package
             if (File.Exists(manifestDestPath) && !filteredDependencies.Contains(manifestDestPath))
             {
                 filteredDependencies.Add(manifestDestPath);
@@ -220,8 +217,12 @@ public class BoothExporterWindow : EditorWindow
 
             CreateLocalBackup(packageFilePath, descriptor.boothName);
             
-            EditorUtility.DisplayProgressBar("Booth Exporter", "Loading package into memory...", 0.7f);
+            EditorUtility.DisplayProgressBar("Booth Exporter", "Checking server limits...", 0.7f);
             byte[] packageData = await File.ReadAllBytesAsync(packageFilePath);
+
+            // --- SIZE PRE-CHECK ---
+            bool isSizeValid = await CheckServerLimitsAsync(packageData.Length);
+            if (!isSizeValid) return;
 
             await UploadToServer(packageData, descriptor);
             Debug.Log("[Booth SDK] Export and upload completed successfully.");
@@ -234,7 +235,6 @@ public class BoothExporterWindow : EditorWindow
         }
         finally
         {
-            // Clean up the temporary VPM file so the user's project stays clean
             if (File.Exists(manifestDestPath))
             {
                 AssetDatabase.DeleteAsset(manifestDestPath);
@@ -244,6 +244,44 @@ public class BoothExporterWindow : EditorWindow
             if (Directory.Exists(exportFolderPath)) Directory.Delete(exportFolderPath, true);
             AssetDatabase.Refresh();
         }
+    }
+
+    private async Task<bool> CheckServerLimitsAsync(long localSizeBytes)
+    {
+        using (UnityWebRequest req = UnityWebRequest.Get(LimitsEndpoint))
+        {
+            var operation = req.SendWebRequest();
+            while (!operation.isDone) await Task.Delay(50);
+
+            if (req.result == UnityWebRequest.Result.Success)
+            {
+                ServerLimits limits = JsonUtility.FromJson<ServerLimits>(req.downloadHandler.text);
+                
+                if (localSizeBytes > limits.maxSizeBytes)
+                {
+                    float localSizeMb = localSizeBytes / (1024f * 1024f);
+                    
+                    EditorUtility.DisplayDialog("Upload Failed", 
+                        $"File could not be uploaded. The server accepts unitypackages up to {limits.maxSizeMb} MB. " +
+                        $"The unitypackage you just created is {localSizeMb:F1} MB.\n\n" +
+                        $"Please try to lower the resolution of your source files and try again.", "OK");
+                        
+                    return false;
+                }
+            }
+            else
+            {
+                Debug.LogWarning($"[Booth SDK] Could not fetch server limits for pre-check: {req.error}. Attempting upload anyway.");
+            }
+        }
+        return true;
+    }
+
+    [System.Serializable]
+    private class ServerLimits
+    {
+        public int maxSizeMb;
+        public long maxSizeBytes;
     }
 
     private bool ShouldSkipDependency(string dep)
@@ -263,7 +301,7 @@ public class BoothExporterWindow : EditorWindow
         }
 
         if (dep.Contains("BoothDescriptor.cs")) return true;
-        if (dep.EndsWith("_VPM.json")) return true; // Handled manually
+        if (dep.EndsWith("_VPM.json")) return true; 
 
         return false;
     }
@@ -346,25 +384,38 @@ public class BoothExporterWindow : EditorWindow
             return;
         }
 
-        string[] guids = AssetDatabase.FindAssets("ConBoothArea t:Prefab");
-        
-        if (guids.Length == 0)
+        string packagePath = "Packages/name.tummy.tcboothsdk/Runtime/BoothLimits/ConBoothArea.prefab";
+        GameObject prefabAsset = null;
+
+        AssetDatabase.ImportAsset(packagePath, ImportAssetOptions.ForceUpdate);
+        prefabAsset = AssetDatabase.LoadMainAssetAtPath(packagePath) as GameObject;
+
+        if (prefabAsset == null)
+        {
+            string[] guids = AssetDatabase.FindAssets("ConBoothArea t:Prefab");
+            foreach (string g in guids)
+            {
+                string foundPath = AssetDatabase.GUIDToAssetPath(g);
+                if (foundPath.EndsWith(".prefab"))
+                {
+                    AssetDatabase.ImportAsset(foundPath, ImportAssetOptions.ForceUpdate);
+                    prefabAsset = AssetDatabase.LoadMainAssetAtPath(foundPath) as GameObject;
+                    if (prefabAsset != null) break;
+                }
+            }
+        }
+
+        if (prefabAsset == null)
         {
             EditorUtility.DisplayDialog("Not Found", "Could not find the 'ConBoothArea' prefab.\n\nPlease ensure the required VPM package is installed or the prefab is in your project.", "OK");
             return;
         }
 
-        string assetPath = AssetDatabase.GUIDToAssetPath(guids[0]);
-        GameObject prefabAsset = AssetDatabase.LoadAssetAtPath<GameObject>(assetPath);
-
-        if (prefabAsset != null)
-        {
-            GameObject instance = (GameObject)PrefabUtility.InstantiatePrefab(prefabAsset);
-            instance.name = "ConBoothArea"; 
-            Selection.activeGameObject = instance;
-            if (SceneView.lastActiveSceneView != null) SceneView.lastActiveSceneView.FrameSelected();
-            Debug.Log("[Booth SDK] Reference area spawned successfully.");
-        }
+        GameObject instance = (GameObject)PrefabUtility.InstantiatePrefab(prefabAsset);
+        instance.name = "ConBoothArea"; 
+        Selection.activeGameObject = instance;
+        if (SceneView.lastActiveSceneView != null) SceneView.lastActiveSceneView.FrameSelected();
+        Debug.Log("[Booth SDK] Reference area spawned successfully.");
     }
     
     private async Task UploadToServer(byte[] packageData, BoothDescriptor descriptor)
