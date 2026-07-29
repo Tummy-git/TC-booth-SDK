@@ -186,11 +186,27 @@ public class BoothExporterWindow : EditorWindow
             
             string[] rawDependencies = AssetDatabase.GetDependencies(prefabPath, true);
             List<string> filteredDependencies = new List<string>();
+            List<string> shaderDebugList = new List<string>(); // NEW: Track shaders for logs
 
             foreach (string dep in rawDependencies)
             {
                 if (ShouldSkipDependency(dep)) continue;
-                if (dep.StartsWith("Assets/")) filteredDependencies.Add(dep);
+                if (dep.StartsWith("Assets/")) 
+                {
+                    filteredDependencies.Add(dep);
+                    
+                    // NEW: Log if it is a custom shader file or include
+                    if (dep.EndsWith(".shader") || dep.EndsWith(".cginc") || dep.EndsWith(".hlsl"))
+                    {
+                        shaderDebugList.Add(dep);
+                    }
+                }
+            }
+
+            // NEW: Print the results to the Unity Console
+            if (shaderDebugList.Count > 0)
+            {
+                Debug.Log($"[Booth SDK] Bundling {shaderDebugList.Count} custom shader files:\n" + string.Join("\n", shaderDebugList));
             }
 
             // Force the injected manifest into the package
@@ -237,7 +253,8 @@ public class BoothExporterWindow : EditorWindow
             "Packages/",
             "Resources/",
             "Assets/TextMesh Pro/",
-            "Assets/SerializedUdonPrograms/"
+            "Assets/SerializedUdonPrograms/",
+            "Assets/Mochie/"
         };
 
         foreach (string prefix in skipPrefixes)
