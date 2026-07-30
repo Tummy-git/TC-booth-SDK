@@ -1,76 +1,53 @@
-# VPM Package Template
+# TummyCon Booth SDK
 
-Starter for making Packages, including automation for building and publishing them.
+Welcome to the **TummyCon Booth SDK**! This toolkit is designed to help creators easily build, test, and export their virtual convention booths for the event. 
 
-Once you're all set up, you'll be able to push changes to this repository and have .zip and .unitypackage versions automatically generated, and a listing made which works in the VPM for delivering updates for this package. If you want to make a listing with a variety of packages, check out our [template-package-listing](https://github.com/vrchat-community/template-package-listing) repo.
+---
 
-## ▶ Getting Started
+## 📂 1. Mandatory Folder Structure
 
-* Press [![Use This Template](https://user-images.githubusercontent.com/737888/185467681-e5fdb099-d99f-454b-8d9e-0760e5a6e588.png)](https://github.com/vrchat-community/template-package/generate)
-to start a new GitHub project based on this template.
-  * Choose a fitting repository name and description.
-  * Set the visibility to 'Public'. You can also choose 'Private' and change it later.
-  * You don't need to select 'Include all branches.'
-* Clone this repository locally using Git.
-  * If you're unfamiliar with Git and GitHub, [visit GitHub's documentation](https://docs.github.com/en/get-started/quickstart/git-and-github-learning-resources) to learn more.
-* Add the folder to Unity Hub and open it as a Unity Project.
-* After opening the project, wait while the VPM resolver is downloaded and added to your project.
-  * This gives you access to the VPM Package Maker and Package Resolver tools.
+To ensure your booth is packaged and accepted correctly by the server, **all your booth assets must be placed strictly inside a dedicated folder** matching your name:
 
-## 🚇 Migrating Assets Package
-Full details at [Converting Assets to a VPM Package](https://vcc.docs.vrchat.com/guides/convert-unitypackage)
+> `Assets/Booth/[YourUsername]/`
 
-## ✏️ Working on Your Package
+*   **Rule:** If any asset (models, materials, textures, shaders) required by your booth is located outside this folder, the SDK exporter will **reject the export** and flag an error.
+*   **Excluded Assets:** System folders like `TextMesh Pro`, `SerializedUdonPrograms`, and `Mochie` are automatically filtered out.
 
-* Delete the "Packages/com.vrchat.demo-template" directory or reuse it for your own package.
-  * If you reuse the package, don't forget to rename it and add generated meta files to your repository!
-* Update the `.gitignore` file in the "Packages" directory to include your package.
-  * For example, change `!com.vrchat.demo-template` to `!com.username.package-name`.
-  * `.gitignore` files normally *exclude* the contents of your "Packages" directory. This `.gitignore` in this template show how to *include* the demo package. You can easily change this out for your own package name.
-* Open the Unity project and work on your package's files in your favorite code editor.
-* When you're ready, commit and push your changes.
-* Once you've set up the automation as described below, you can easily publish new versions.
+---
 
-## 🤖 Setting up the Automation
+## 🚀 2. Getting Started & Setup
 
-Create a repository variable with the name and value described below.
-For details on how to create repository variables, see [Creating Configuration Variables for a Repository](https://docs.github.com/en/actions/learn-github-actions/variables#creating-configuration-variables-for-a-repository).
-Make sure you are creating a **repository variable**, and not a **repository secret**.
+1. **Install VPM Package:** [Click this link to get to the listing. https://tummy-git.github.io/TC-booth-SDK/](https://tummy-git.github.io/TC-booth-SDK/)
+2. **Open the Exporter:** Navigate to the top menu and select **Booth SDK > Open Booth Exporter**.
+3. **Spawn the Reference Area:** Click **"Spawn Booth Reference Area"** in the Exporter window. This drops the `ConBoothArea` prefab into your scene to give you an accurate physical boundary and scale reference for your booth. *(Note: Make sure this reference object is **not** part of your final booth hierarchy when exporting!)*
 
-* `PACKAGE_NAME`: the name of your package, like `com.vrchat.demo-template`.
+---
 
-Finally, go to the "Settings" page for your repo, then choose "Pages", and look for the heading "Build and deployment". Change the "Source" dropdown from "Deploy from a branch" to "GitHub Actions".
+## 📦 3. Preparing Your Booth
 
-That's it!
-Some other notes:
-* We highly recommend you keep the existing folder structure of this template.
-  * The root of the project should be a Unity project.
-  * Your packages should be in the "Packages" directory.
-  * If you deviate from this folder structure, you'll need to update the paths that assume your package is in the "Packages" directory on lines 24, 38, 41 and 57.
-* If you want to store and generate your web files in a folder other than "Website" in the root, you can change the `listPublicDirectory` item [here in build-listing.yml](.github/workflows/build-listing.yml#L17).
+1. Create an active GameObject in your scene for your booth.
+2. Attach the **`BoothDescriptor`** component to it.
+3. Fill in your **VRChat Username** and the **Booth Name** in the component fields.
+4. Organize all your booth's models, colliders, animations, materials, and scripts as children of this GameObject.
 
-## 🎉 Publishing a Release
+### ⚠️ Important Restrictions
+* **No Scene Descriptors:** You are **not** allowed to place a `VRCSceneDescriptor` component inside your booth. Doing so will conflict with the Master Project settings and trigger a component violation error.
+* **Shaders & Includes:** Custom shaders and `.cginc` include files are fully supported. The SDK automatically traces recursive shader dependencies so you don't have to worry about missing include files.
 
-You can make a release by running the [Build Release](.github/workflows/release.yml) action. The version specified in your `package.json` file will be used to define the version of the release.
+---
 
-## 📃 Rebuilding the Listing
+## 🛠️ 4. Exporting and Uploading
 
-Whenever you make a change to a release - manually publishing it, or manually creating, editing or deleting a release, the [Build Repo Listing](.github/workflows/build-listing.yml) action will make a new index of all the releases available, and publish them as a website hosted fore free on [GitHub Pages](https://pages.github.com/). This listing can be used by the VPM to keep your package up to date, and the generated index page can serve as a simple landing page with info for your package. The URL for your package will be in the format `https://username.github.io/repo-name`.
+When you are ready to submit your booth:
 
-## 🏠 Customizing the Landing Page (Optional)
+1. Open the **Booth Exporter** window (**Booth SDK > Open Booth Exporter**).
+2. Enter your assigned **Server Username** and **Password** (these are saved locally via `EditorPrefs` for convenience).
+3. Ensure **"Clean unused ghost properties from materials"** is checked (Recommended). This automatically strips out invisible junk data left behind when changing shaders, keeping your file size small.
+4. Click **"Build and Export Booth"**. 
 
-The action which rebuilds the listing also publishes a landing page. The source for this page is in `Website/index.html`. The automation system uses [Scriban](https://github.com/scriban/scriban) to fill in the objects like `{{ this }}` with information from the latest release's manifest, so it will stay up-to-date with the name, id and description that you provide there. You are welcome to modify this page however you want - just use the existing `{{ template.objects }}` to fill in that info wherever you like. The entire contents of your "Website" folder are published to your GitHub Page each time.
-
-## 💻 Technical Stuff
-
-You are welcome to make your own changes to the automation process to make it fit your needs, and you can create Pull Requests if you have some changes you think we should adopt. Here's some more info on the included automation:
-
-### Build Release Action
-[release.yml](/.github/workflows/release.yml)
-
-This is a composite action combining a variety of existing GitHub Actions and some shell commands to create both a .zip of your Package and a .unitypackage. It creates a release which is named for the `version` in the `package.json` file found in your target Package, and publishes the zip, the unitypackage and the package.json file to this release.
-
-### Build Repo Listing
-[build-listing.yml](.github/workflows/build-listing.yml)
-
-This is a composite action which builds a vpm-compatible [Repo Listing](https://vcc.docs.vrchat.com/vpm/repos) based on the releases you've created. In order to find all your releases and combine them into a listing, it checks out [another repository](https://github.com/vrchat-community/package-list-action) which has a [Nuke](https://nuke.build/) project which includes the VPM core lib to have access to its types and methods. This project will be expanded to include more functionality in the future - for now, the action just calls its `BuildRepoListing` target.
+### What happens when you click export?
+*   It generates a clean local prefab of your booth.
+*   It validates that all dependencies live inside your designated `Assets/Booth/[YourUsername]/` folder.
+*   It packages your assets into a local `.unitypackage` and saves a backup copy locally in the `BoothExports/` folder.
+*   It performs a size pre-check against the server limits.
+*   It securely uploads your booth package directly to the event server.
