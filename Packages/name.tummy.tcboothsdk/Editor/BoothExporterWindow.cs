@@ -358,7 +358,9 @@ public class BoothExporterWindow : EditorWindow
         {
             "Assets/TextMesh Pro/",
             "Assets/SerializedUdonPrograms/",
-            "Assets/Mochie/"
+            "Assets/Mochie/",
+            "Assets/Bakery/",
+            "Assets/BakeryLightmaps"
         };
 
         foreach (string prefix in skipPrefixes)
