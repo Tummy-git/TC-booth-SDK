@@ -11,6 +11,7 @@ public class BoothExporterWindow : EditorWindow
 {
     private string serverUsername = "";
     private string serverPassword = "";
+    private bool cleanMaterials = true;
     
     private const string ServerBaseUrl = "https://upload.tummy.name";
     private const string ServerEndpoint = ServerBaseUrl + "/upload-booth"; 
@@ -21,6 +22,7 @@ public class BoothExporterWindow : EditorWindow
 
     private const string PrefKey_User = "BoothSDK_Username";
     private const string PrefKey_Pass = "BoothSDK_Password";
+    private const string PrefKey_CleanMat = "BoothSDK_CleanMaterials";
 
     private Regex SHADER_INCLUDE_REGEX = new Regex(@"^\s*#\s*include\s*""(.*)""$");
 
@@ -34,6 +36,7 @@ public class BoothExporterWindow : EditorWindow
     {
         serverUsername = EditorPrefs.GetString(PrefKey_User, "");
         serverPassword = EditorPrefs.GetString(PrefKey_Pass, "");
+        cleanMaterials = EditorPrefs.GetBool(PrefKey_CleanMat, true);
     }
 
     private void OnGUI()
@@ -77,6 +80,22 @@ public class BoothExporterWindow : EditorWindow
         EditorGUILayout.Space();
         EditorGUILayout.LabelField("", GUI.skin.horizontalSlider);
         EditorGUILayout.Space();
+
+        // --- NEW: Optimization UI ---
+        GUILayout.Label("Optimization", EditorStyles.boldLabel);
+        
+        EditorGUI.BeginChangeCheck();
+        cleanMaterials = EditorGUILayout.ToggleLeft(" Clean unused ghost properties from materials (Recommended)", cleanMaterials);
+        if (EditorGUI.EndChangeCheck())
+        {
+            EditorPrefs.SetBool(PrefKey_CleanMat, cleanMaterials);
+        }
+        
+        GUIStyle wrapStyle = new GUIStyle(GUI.skin.label) { wordWrap = true, fontSize = 11, fontStyle = FontStyle.Italic };
+        GUILayout.Label("Automatically removes hidden textures left behind when changing shaders. You probably want this enabled to prevent your file size from bloating with unused assets!", wrapStyle);
+        
+        EditorGUILayout.Space();
+        // ----------------------------
 
         if (GUILayout.Button("Build and Export Booth", GUILayout.Height(40)))
         {
@@ -168,6 +187,12 @@ public class BoothExporterWindow : EditorWindow
             GameObject prefab = PrefabUtility.SaveAsPrefabAssetAndConnect(descriptor.gameObject, prefabPath, InteractionMode.AutomatedAction);
             if (prefab == null) throw new System.Exception("Failed to generate booth Prefab.");
 
+            // --- NEW: Ghost Property Cleaner Integration ---
+            if (cleanMaterials)
+            {
+                EditorUtility.DisplayProgressBar("Booth Exporter", "Cleaning Material Properties...", 0.25f);
+                CleanGhostPropertiesInDependencies(prefabPath, userRootFolder);
+            }
 
             string dependencyError;
             HashSet<string> dependencies = GetDependencies(prefabPath, out dependencyError);
@@ -195,7 +220,6 @@ public class BoothExporterWindow : EditorWindow
 
             EditorUtility.DisplayProgressBar("Booth Exporter", "Resolving dependencies...", 0.4f);
             
-            // --- OUR SHADER LOGGING APPLIED TO THE HASHSET ---
             List<string> shaderDebugList = new List<string>(); 
             foreach (string dep in dependencies)
             {
@@ -222,7 +246,6 @@ public class BoothExporterWindow : EditorWindow
             EditorUtility.DisplayProgressBar("Booth Exporter", "Checking server limits...", 0.7f);
             byte[] packageData = await File.ReadAllBytesAsync(packageFilePath);
 
-
             bool isSizeValid = await CheckServerLimitsAsync(packageData.Length);
             if (!isSizeValid) return;
 
@@ -247,8 +270,6 @@ public class BoothExporterWindow : EditorWindow
             AssetDatabase.Refresh();
         }
     }
-
-    // --- NEW DEPENDENCY PARSERS ---
 
     private HashSet<string> GetDependencies(string prefabPath, out string errorMessage)
     {
@@ -502,5 +523,68 @@ public class BoothExporterWindow : EditorWindow
             if (request.result == UnityWebRequest.Result.Success) EditorUtility.DisplayDialog("Upload Complete", "Upload successful.", "OK");
             else throw new System.Exception($"Server rejected the upload: {request.error}");
         }
+    }
+
+    // --- AUTOMATIC GHOST PROPERTY CLEANER ---
+    private void CleanGhostPropertiesInDependencies(string prefabPath, string allowedRootFolder)
+    {
+        string[] rawDependencies = AssetDatabase.GetDependencies(prefabPath, true);
+        int cleanedCount = 0;
+
+        foreach (string dep in rawDependencies)
+        {
+            if (dep.EndsWith(".mat") && dep.StartsWith(allowedRootFolder))
+            {
+                Material mat = AssetDatabase.LoadAssetAtPath<Material>(dep);
+                if (mat != null)
+                {
+                    SerializedObject so = new SerializedObject(mat);
+                    so.Update();
+
+                    bool changed = false;
+                    changed |= RemoveUnusedProperties(so, "m_SavedProperties.m_TexEnvs", mat);
+                    changed |= RemoveUnusedProperties(so, "m_SavedProperties.m_Ints", mat);
+                    changed |= RemoveUnusedProperties(so, "m_SavedProperties.m_Floats", mat);
+                    changed |= RemoveUnusedProperties(so, "m_SavedProperties.m_Colors", mat);
+
+                    if (changed)
+                    {
+                        so.ApplyModifiedProperties();
+                        EditorUtility.SetDirty(mat);
+                        cleanedCount++;
+                    }
+                }
+            }
+        }
+
+        if (cleanedCount > 0)
+        {
+            AssetDatabase.SaveAssets();
+            Debug.Log($"[Booth SDK] Automatically cleaned hidden ghost properties from {cleanedCount} materials.");
+        }
+    }
+
+    private bool RemoveUnusedProperties(SerializedObject so, string propertyPath, Material mat)
+    {
+        SerializedProperty propArray = so.FindProperty(propertyPath);
+        if (propArray == null || !propArray.isArray) return false;
+
+        bool changed = false;
+        
+        for (int i = propArray.arraySize - 1; i >= 0; i--)
+        {
+            SerializedProperty prop = propArray.GetArrayElementAtIndex(i);
+            SerializedProperty nameProp = prop.FindPropertyRelative("first");
+            
+            if (nameProp != null)
+            {
+                if (!mat.HasProperty(nameProp.stringValue))
+                {
+                    propArray.DeleteArrayElementAtIndex(i);
+                    changed = true;
+                }
+            }
+        }
+        return changed;
     }
 }
