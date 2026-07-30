@@ -4,6 +4,8 @@ using UnityEngine.Networking;
 using System.IO;
 using System.Threading.Tasks;
 using System.Collections.Generic;
+using System.Text.RegularExpressions;
+using System.Linq;
 
 public class BoothExporterWindow : EditorWindow
 {
@@ -19,6 +21,8 @@ public class BoothExporterWindow : EditorWindow
 
     private const string PrefKey_User = "BoothSDK_Username";
     private const string PrefKey_Pass = "BoothSDK_Password";
+
+    private Regex SHADER_INCLUDE_REGEX = new Regex(@"^\s*#\s*include\s*""(.*)""$");
 
     [MenuItem("Booth SDK/Open Booth Exporter")]
     public static void ShowWindow()
@@ -48,7 +52,6 @@ public class BoothExporterWindow : EditorWindow
         
         EditorGUILayout.Space();
 
-        // --- CREATOR TOOLS SECTION ---
         GUILayout.Label("Creator Tools", EditorStyles.boldLabel);
         if (GUILayout.Button("Spawn Booth Reference Area", GUILayout.Height(30)))
         {
@@ -165,13 +168,21 @@ public class BoothExporterWindow : EditorWindow
             GameObject prefab = PrefabUtility.SaveAsPrefabAssetAndConnect(descriptor.gameObject, prefabPath, InteractionMode.AutomatedAction);
             if (prefab == null) throw new System.Exception("Failed to generate booth Prefab.");
 
-            if (!ValidateFolderStructure(prefabPath, userRootFolder, out string folderError))
+
+            string dependencyError;
+            HashSet<string> dependencies = GetDependencies(prefabPath, out dependencyError);
+            if (dependencies == null)
+            {
+                EditorUtility.DisplayDialog("Dependency Error", dependencyError, "OK");
+                return;
+            }
+
+            if (!ValidateFolderStructure(dependencies, userRootFolder, out string folderError))
             {
                 EditorUtility.DisplayDialog("Folder Structure Error", folderError, "OK");
                 return;
             }
 
-            // --- INJECT VPM MANIFEST ---
             string vpmManifestSrc = "Packages/vpm-manifest.json";
             if (File.Exists(vpmManifestSrc))
             {
@@ -184,43 +195,34 @@ public class BoothExporterWindow : EditorWindow
 
             EditorUtility.DisplayProgressBar("Booth Exporter", "Resolving dependencies...", 0.4f);
             
-            string[] rawDependencies = AssetDatabase.GetDependencies(prefabPath, true);
-            List<string> filteredDependencies = new List<string>();
+            // --- OUR SHADER LOGGING APPLIED TO THE HASHSET ---
             List<string> shaderDebugList = new List<string>(); 
-
-            foreach (string dep in rawDependencies)
+            foreach (string dep in dependencies)
             {
-                if (ShouldSkipDependency(dep)) continue;
-                if (dep.StartsWith("Assets/")) 
+                if (dep.EndsWith(".shader") || dep.EndsWith(".cginc") || dep.EndsWith(".hlsl"))
                 {
-                    filteredDependencies.Add(dep);
-                    
-                    if (dep.EndsWith(".shader") || dep.EndsWith(".cginc") || dep.EndsWith(".hlsl"))
-                    {
-                        shaderDebugList.Add(dep);
-                    }
+                    shaderDebugList.Add(dep);
                 }
             }
-
             if (shaderDebugList.Count > 0)
             {
                 Debug.Log($"[Booth SDK] Bundling {shaderDebugList.Count} custom shader files:\n" + string.Join("\n", shaderDebugList));
             }
 
-            if (File.Exists(manifestDestPath) && !filteredDependencies.Contains(manifestDestPath))
+            if (File.Exists(manifestDestPath))
             {
-                filteredDependencies.Add(manifestDestPath);
+                dependencies.Add(manifestDestPath);
             }
 
             EditorUtility.DisplayProgressBar("Booth Exporter", "Packaging filtered assets...", 0.5f);
-            AssetDatabase.ExportPackage(filteredDependencies.ToArray(), packageFilePath, ExportPackageOptions.Default);
+            AssetDatabase.ExportPackage(dependencies.ToArray(), packageFilePath, ExportPackageOptions.Default);
 
             CreateLocalBackup(packageFilePath, descriptor.boothName);
             
             EditorUtility.DisplayProgressBar("Booth Exporter", "Checking server limits...", 0.7f);
             byte[] packageData = await File.ReadAllBytesAsync(packageFilePath);
 
-            // --- SIZE PRE-CHECK ---
+
             bool isSizeValid = await CheckServerLimitsAsync(packageData.Length);
             if (!isSizeValid) return;
 
@@ -244,6 +246,70 @@ public class BoothExporterWindow : EditorWindow
             if (Directory.Exists(exportFolderPath)) Directory.Delete(exportFolderPath, true);
             AssetDatabase.Refresh();
         }
+    }
+
+    // --- NEW DEPENDENCY PARSERS ---
+
+    private HashSet<string> GetDependencies(string prefabPath, out string errorMessage)
+    {
+        errorMessage = "";
+        string[] rawDependencies = AssetDatabase.GetDependencies(prefabPath, true);
+        HashSet<string> dependencies = new HashSet<string>(rawDependencies);
+
+        foreach (string dep in rawDependencies)
+        {
+            if (dep.EndsWith(".shader"))
+            {
+                if (!GetShaderDependencies(dep, dependencies, out errorMessage)) return null;
+            }
+        }
+
+        dependencies.RemoveWhere(dep => ShouldSkipDependency(dep));
+        return dependencies;
+    }
+
+    private bool GetShaderDependencies(string dep, HashSet<string> dependencies, out string errorMessage)
+    {
+        errorMessage = "";
+
+        foreach (string line in File.ReadLines(dep))
+        {
+            Match m = SHADER_INCLUDE_REGEX.Match(line);
+            if (m.Success)
+            {
+                string includeName = m.Groups[1].Value;
+                includeName = includeName.TrimStart('/');
+                string assetPath = Path.GetRelativePath(".", Path.Join(Path.GetDirectoryName(dep), includeName));
+
+                if (!File.Exists(assetPath))
+                {
+                    assetPath = Path.GetRelativePath(".", includeName);
+                    if (!File.Exists(assetPath))
+                    {
+                        if (!File.Exists(Path.Join(EditorApplication.applicationContentsPath, "CGIncludes", includeName)))
+                        {
+                            errorMessage = $"Cannot find dependency '{includeName}' included from '{dep}'";
+                            return false;
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                    }
+                }
+
+                assetPath = assetPath.Replace("\\", "/");
+
+                if (!ShouldSkipDependency(assetPath))
+                {
+                    if (dependencies.Add(assetPath))
+                    {
+                        if (!GetShaderDependencies(assetPath, dependencies, out errorMessage)) return false;
+                    }
+                }
+            }
+        }
+        return true;
     }
 
     private async Task<bool> CheckServerLimitsAsync(long localSizeBytes)
@@ -286,10 +352,10 @@ public class BoothExporterWindow : EditorWindow
 
     private bool ShouldSkipDependency(string dep)
     {
+        if (!dep.StartsWith("Assets/")) return true;
+
         string[] skipPrefixes = new string[] 
         {
-            "Packages/",
-            "Resources/",
             "Assets/TextMesh Pro/",
             "Assets/SerializedUdonPrograms/",
             "Assets/Mochie/"
@@ -330,24 +396,17 @@ public class BoothExporterWindow : EditorWindow
         return true;
     }
     
-    private bool ValidateFolderStructure(string prefabPath, string requiredRootPath, out string errorMessage)
+    private bool ValidateFolderStructure(HashSet<string> dependencies, string requiredRootPath, out string errorMessage)
     {
         errorMessage = "";
-        string[] rawDependencies = AssetDatabase.GetDependencies(prefabPath, true);
-
-        foreach (string dep in rawDependencies)
+        foreach (string dep in dependencies)
         {
-            if (ShouldSkipDependency(dep)) continue; 
-
-            if (dep.StartsWith("Assets/"))
+            if (!dep.StartsWith(requiredRootPath))
             {
-                if (!dep.StartsWith(requiredRootPath))
-                {
-                    errorMessage = $"Asset Violation: '{dep}' is located outside your designated root folder.\n\n" +
-                                   $"All booth assets must be placed strictly inside:\n{requiredRootPath}/\n\n" +
-                                   $"Please move the asset, update your scene object, and try again.";
-                    return false;
-                }
+                errorMessage = $"Asset Violation: '{dep}' is located outside your designated root folder.\n\n" +
+                               $"All booth assets must be placed strictly inside:\n{requiredRootPath}/\n\n" +
+                               $"Please move the asset, update your scene object, and try again.";
+                return false;
             }
         }
         return true;
