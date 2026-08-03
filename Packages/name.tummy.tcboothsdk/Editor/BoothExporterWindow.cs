@@ -81,7 +81,7 @@ public class BoothExporterWindow : EditorWindow
         EditorGUILayout.LabelField("", GUI.skin.horizontalSlider);
         EditorGUILayout.Space();
 
-        // --- NEW: Optimization UI ---
+        // --- Optimization UI ---
         GUILayout.Label("Optimization", EditorStyles.boldLabel);
         
         EditorGUI.BeginChangeCheck();
@@ -187,7 +187,6 @@ public class BoothExporterWindow : EditorWindow
             GameObject prefab = PrefabUtility.SaveAsPrefabAssetAndConnect(descriptor.gameObject, prefabPath, InteractionMode.AutomatedAction);
             if (prefab == null) throw new System.Exception("Failed to generate booth Prefab.");
 
-            // --- NEW: Ghost Property Cleaner Integration ---
             if (cleanMaterials)
             {
                 EditorUtility.DisplayProgressBar("Booth Exporter", "Cleaning Material Properties...", 0.25f);
@@ -347,10 +346,17 @@ public class BoothExporterWindow : EditorWindow
                 if (localSizeBytes > limits.maxSizeBytes)
                 {
                     float localSizeMb = localSizeBytes / (1024f * 1024f);
+                    long overageBytes = localSizeBytes - limits.maxSizeBytes;
+                    
+                    string overageText;
+                    if (overageBytes >= 1048576) overageText = $"{overageBytes / 1048576f:F2} MB";
+                    else if (overageBytes >= 1024) overageText = $"{overageBytes / 1024f:F1} KB";
+                    else overageText = $"{overageBytes} Bytes";
                     
                     EditorUtility.DisplayDialog("Upload Failed", 
-                        $"File could not be uploaded. The server accepts unitypackages up to {limits.maxSizeMb} MB. " +
-                        $"The unitypackage you just created is {localSizeMb:F1} MB.\n\n" +
+                        $"File could not be uploaded. The server accepts unitypackages up to {limits.maxSizeMb} MB.\n\n" +
+                        $"The unitypackage you just created is {localSizeMb:F2} MB.\n" +
+                        $"You are over the limit by exactly {overageText}.\n\n" +
                         $"Please try to lower the resolution of your source files and try again.", "OK");
                         
                     return false;
@@ -525,7 +531,6 @@ public class BoothExporterWindow : EditorWindow
         }
     }
 
-    // --- AUTOMATIC GHOST PROPERTY CLEANER ---
     private void CleanGhostPropertiesInDependencies(string prefabPath, string allowedRootFolder)
     {
         string[] rawDependencies = AssetDatabase.GetDependencies(prefabPath, true);
