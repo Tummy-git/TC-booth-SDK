@@ -278,7 +278,8 @@ public class BoothExporterWindow : EditorWindow
 
         foreach (string dep in rawDependencies)
         {
-            if (dep.EndsWith(".shader"))
+            // Now checks for standard shaders, orlshaders, and include files!
+            if (dep.EndsWith(".shader") || dep.EndsWith(".orlshader") || dep.EndsWith(".cginc") || dep.EndsWith(".hlsl"))
             {
                 if (!GetShaderDependencies(dep, dependencies, out errorMessage)) return null;
             }
