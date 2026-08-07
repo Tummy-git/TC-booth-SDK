@@ -201,6 +201,14 @@ public class BoothExporterWindow : EditorWindow
                 return;
             }
 
+            //This badboy includes all .cs files in the users booth folder. Insane but probably solves some problems.
+            string[] codeGuids = AssetDatabase.FindAssets("t:MonoScript t:AssemblyDefinitionAsset", new[] { userRootFolder });
+            foreach (string guid in codeGuids)
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                dependencies.Add(path);
+            }
+            
             if (!ValidateFolderStructure(dependencies, userRootFolder, out string folderError))
             {
                 EditorUtility.DisplayDialog("Folder Structure Error", folderError, "OK");
