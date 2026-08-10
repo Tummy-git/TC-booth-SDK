@@ -61,6 +61,20 @@ public class BoothExporterWindow : EditorWindow
             SpawnReferencePrefab();
         }
 
+        // --- NEW: Name Plate Button ---
+        if (GUILayout.Button("Spawn / Update Name Plate", GUILayout.Height(30)))
+        {
+            BoothDescriptor desc = FindActiveBooth();
+            if (desc != null)
+            {
+                SpawnOrUpdateNamePlate(desc);
+            }
+            else
+            {
+                EditorUtility.DisplayDialog("Error", "No active BoothDescriptor found in the scene to attach the plate to.", "OK");
+            }
+        }
+
         EditorGUILayout.Space();
         EditorGUILayout.LabelField("", GUI.skin.horizontalSlider);
         EditorGUILayout.Space();
@@ -102,6 +116,10 @@ public class BoothExporterWindow : EditorWindow
             _ = ExportBoothAsync();
         }
 
+        EditorGUILayout.Space();
+        
+        GUILayout.Label("When you upload, the unitypackage is saved locally as well. Click below to find the folder.", wrapStyle);
+        
         EditorGUILayout.Space();
 
         if (GUILayout.Button("Open Local Backup Folder", GUILayout.Height(25)))
@@ -174,6 +192,13 @@ public class BoothExporterWindow : EditorWindow
 
         try
         {
+            // --- NEW: Sync Name Plate Text before doing anything else ---
+            Transform existingPlate = descriptor.transform.Find("BoothNamePlate");
+            if (existingPlate != null)
+            {
+                UpdateNamePlateText(existingPlate.gameObject, descriptor);
+            }
+            
             EditorUtility.DisplayProgressBar("Booth Exporter", "Generating Prefab...", 0.2f);
 
             if (!AssetDatabase.IsValidFolder(userRootFolder))
@@ -201,7 +226,6 @@ public class BoothExporterWindow : EditorWindow
                 return;
             }
 
-            //This badboy includes all .cs files in the users booth folder. Insane but probably solves some problems.
             string[] codeGuids = AssetDatabase.FindAssets("t:MonoScript t:AssemblyDefinitionAsset", new[] { userRootFolder });
             foreach (string guid in codeGuids)
             {
@@ -286,7 +310,6 @@ public class BoothExporterWindow : EditorWindow
 
         foreach (string dep in rawDependencies)
         {
-            // Now checks for standard shaders, orlshaders, and include files!
             if (dep.EndsWith(".shader") || dep.EndsWith(".orlshader") || dep.EndsWith(".cginc") || dep.EndsWith(".hlsl"))
             {
                 if (!GetShaderDependencies(dep, dependencies, out errorMessage)) return null;
@@ -514,6 +537,95 @@ public class BoothExporterWindow : EditorWindow
         if (SceneView.lastActiveSceneView != null) SceneView.lastActiveSceneView.FrameSelected();
         Debug.Log("[Booth SDK] Reference area spawned successfully.");
     }
+    
+    // --- NEW: Name Plate Spawner and Updater ---
+    private void SpawnOrUpdateNamePlate(BoothDescriptor descriptor)
+    {
+        Transform existingPlate = descriptor.transform.Find("BoothNamePlate");
+        GameObject plateObj = null;
+
+        if (existingPlate == null)
+        {
+            string packagePath = "Packages/name.tummy.tcboothsdk/Runtime/BoothNamePlate.prefab";
+            GameObject prefabAsset = null;
+
+            AssetDatabase.ImportAsset(packagePath, ImportAssetOptions.ForceUpdate);
+            prefabAsset = AssetDatabase.LoadMainAssetAtPath(packagePath) as GameObject;
+
+            if (prefabAsset == null)
+            {
+                string[] guids = AssetDatabase.FindAssets("BoothNamePlate t:Prefab");
+                foreach (string g in guids)
+                {
+                    string foundPath = AssetDatabase.GUIDToAssetPath(g);
+                    if (foundPath.EndsWith(".prefab"))
+                    {
+                        AssetDatabase.ImportAsset(foundPath, ImportAssetOptions.ForceUpdate);
+                        prefabAsset = AssetDatabase.LoadMainAssetAtPath(foundPath) as GameObject;
+                        if (prefabAsset != null) break;
+                    }
+                }
+            }
+
+            if (prefabAsset == null)
+            {
+                EditorUtility.DisplayDialog("Not Found", "Could not find the 'BoothNamePlate' prefab.\n\nPlease ensure it is included in your package.", "OK");
+                return;
+            }
+
+            plateObj = (GameObject)PrefabUtility.InstantiatePrefab(prefabAsset, descriptor.transform);
+            plateObj.name = "BoothNamePlate"; 
+            Selection.activeGameObject = plateObj;
+            Debug.Log("[Booth SDK] Name plate spawned and attached to the booth.");
+        }
+        else
+        {
+            plateObj = existingPlate.gameObject;
+        }
+
+        UpdateNamePlateText(plateObj, descriptor);
+        if (SceneView.lastActiveSceneView != null) SceneView.lastActiveSceneView.FrameSelected();
+    }
+
+    private void UpdateNamePlateText(GameObject plateObj, BoothDescriptor descriptor)
+    {
+        // Safe search using Reflection/SerializedObject to avoid TMPro Assembly Definition errors!
+        Component[] allComponents = plateObj.GetComponentsInChildren<Component>(true);
+        bool updated = false;
+
+        foreach (Component comp in allComponents)
+        {
+            if (comp == null) continue;
+            
+            string typeName = comp.GetType().Name;
+            if (typeName == "TextMeshProUGUI" || typeName == "TextMeshPro")
+            {
+                string objName = comp.gameObject.name;
+                if (objName == "CreatorName" || objName == "BoothName")
+                {
+                    SerializedObject so = new SerializedObject(comp);
+                    SerializedProperty textProp = so.FindProperty("m_text");
+                    
+                    if (textProp != null)
+                    {
+                        string newText = (objName == "CreatorName") ? descriptor.creatorName : descriptor.boothName;
+                        if (textProp.stringValue != newText)
+                        {
+                            textProp.stringValue = newText;
+                            so.ApplyModifiedProperties();
+                            updated = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (updated)
+        {
+            Debug.Log("[Booth SDK] Name plate text synchronized with BoothDescriptor.");
+        }
+    }
+    // -------------------------------------------
     
     private async Task UploadToServer(byte[] packageData, BoothDescriptor descriptor)
     {
