@@ -24,6 +24,15 @@ public class BoothExporterWindow : EditorWindow
     private const string PrefKey_Pass = "BoothSDK_Password";
     private const string PrefKey_CleanMat = "BoothSDK_CleanMaterials";
 
+    private const string PackageJsonPath = "Packages/name.tummy.tcboothsdk/package.json";
+    private const string GithubLatestReleaseUrl = "https://api.github.com/repos/Tummy-git/TC-booth-SDK/releases/latest";
+    private const string GithubReleasesPage = "https://github.com/Tummy-git/TC-booth-SDK/releases/latest";
+
+    private static bool updateCheckDone = false;
+    private static bool updateAvailable = false;
+    private static string localVersionStr = "Unknown";
+    private static string remoteVersionStr = "Unknown";
+
     private Regex SHADER_INCLUDE_REGEX = new Regex(@"^\s*#\s*include\s*""(.*)""$");
 
     [MenuItem("Booth SDK/Open Booth Exporter")]
@@ -37,6 +46,11 @@ public class BoothExporterWindow : EditorWindow
         serverUsername = EditorPrefs.GetString(PrefKey_User, "");
         serverPassword = EditorPrefs.GetString(PrefKey_Pass, "");
         cleanMaterials = EditorPrefs.GetBool(PrefKey_CleanMat, true);
+
+        if (!updateCheckDone)
+        {
+            _ = CheckForUpdatesAsync();
+        }
     }
 
     private void OnGUI()
@@ -61,7 +75,6 @@ public class BoothExporterWindow : EditorWindow
             SpawnReferencePrefab();
         }
 
-        // --- NEW: Name Plate Button ---
         if (GUILayout.Button("Spawn / Update Name Plate", GUILayout.Height(30)))
         {
             BoothDescriptor desc = FindActiveBooth();
@@ -95,7 +108,6 @@ public class BoothExporterWindow : EditorWindow
         EditorGUILayout.LabelField("", GUI.skin.horizontalSlider);
         EditorGUILayout.Space();
 
-        // --- Optimization UI ---
         GUILayout.Label("Optimization", EditorStyles.boldLabel);
         
         EditorGUI.BeginChangeCheck();
@@ -109,7 +121,6 @@ public class BoothExporterWindow : EditorWindow
         GUILayout.Label("Automatically removes hidden textures left behind when changing shaders. You probably want this enabled to prevent your file size from bloating with unused assets!", wrapStyle);
         
         EditorGUILayout.Space();
-        // ----------------------------
 
         if (GUILayout.Button("Build and Export Booth", GUILayout.Height(40)))
         {
@@ -128,6 +139,24 @@ public class BoothExporterWindow : EditorWindow
             if (Directory.Exists(path)) EditorUtility.RevealInFinder(path);
             else EditorUtility.DisplayDialog("Folder Not Found", "No backups exist yet. Export a booth first.", "OK");
         }
+
+        // --- UPDATED: HelpBox Version Display ---
+        EditorGUILayout.Space();
+        
+        if (!updateCheckDone)
+        {
+            GUILayout.Label("Checking version...", EditorStyles.centeredGreyMiniLabel);
+        }
+        else if (updateAvailable)
+        {
+            EditorGUILayout.HelpBox($"Your version is {localVersionStr}, there is a newer version {remoteVersionStr} available", MessageType.Warning);
+        }
+        else
+        {
+            GUIStyle boldStyle = new GUIStyle(GUI.skin.label) { fontStyle = FontStyle.Bold };
+            GUILayout.Label(localVersionStr, boldStyle);
+        }
+        // ----------------------------------------
     }
 
     private void ShowTermsAndConditions()
@@ -192,7 +221,6 @@ public class BoothExporterWindow : EditorWindow
 
         try
         {
-            // --- NEW: Sync Name Plate Text before doing anything else ---
             Transform existingPlate = descriptor.transform.Find("BoothNamePlate");
             if (existingPlate != null)
             {
@@ -538,7 +566,6 @@ public class BoothExporterWindow : EditorWindow
         Debug.Log("[Booth SDK] Reference area spawned successfully.");
     }
     
-    // --- NEW: Name Plate Spawner and Updater ---
     private void SpawnOrUpdateNamePlate(BoothDescriptor descriptor)
     {
         Transform existingPlate = descriptor.transform.Find("BoothNamePlate");
@@ -589,7 +616,19 @@ public class BoothExporterWindow : EditorWindow
 
     private void UpdateNamePlateText(GameObject plateObj, BoothDescriptor descriptor)
     {
-        // Safe search using Reflection/SerializedObject to avoid TMPro Assembly Definition errors!
+        try
+        {
+            if (PrefabUtility.IsAnyPrefabInstanceRoot(plateObj))
+            {
+                PrefabUtility.UnpackPrefabInstance(plateObj, PrefabUnpackMode.Completely, InteractionMode.AutomatedAction);
+                Debug.Log("[Booth SDK] Unpacked Name Plate into standard GameObjects to ensure safe export.");
+            }
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogWarning($"[Booth SDK] Note: Could not unpack Name Plate (it may already be unpacked). {ex.Message}");
+        }
+
         Component[] allComponents = plateObj.GetComponentsInChildren<Component>(true);
         bool updated = false;
 
@@ -625,8 +664,75 @@ public class BoothExporterWindow : EditorWindow
             Debug.Log("[Booth SDK] Name plate text synchronized with BoothDescriptor.");
         }
     }
-    // -------------------------------------------
     
+    private async Task CheckForUpdatesAsync()
+    {
+        if (File.Exists(PackageJsonPath))
+        {
+            try
+            {
+                string json = File.ReadAllText(PackageJsonPath);
+                PackageJsonData pkg = JsonUtility.FromJson<PackageJsonData>(json);
+                if (pkg != null && !string.IsNullOrEmpty(pkg.version))
+                {
+                    localVersionStr = pkg.version;
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning($"[Booth SDK] Could not parse local package.json: {e.Message}");
+            }
+        }
+
+        using (UnityWebRequest req = UnityWebRequest.Get(GithubLatestReleaseUrl))
+        {
+            req.SetRequestHeader("User-Agent", "Unity-BoothExporter-SDK");
+            
+            var operation = req.SendWebRequest();
+            while (!operation.isDone) await Task.Delay(50);
+
+            if (req.result == UnityWebRequest.Result.Success)
+            {
+                try
+                {
+                    GithubReleaseData release = JsonUtility.FromJson<GithubReleaseData>(req.downloadHandler.text);
+                    
+                    remoteVersionStr = release.tag_name.Replace("v", "").Trim();
+                    string cleanLocalStr = localVersionStr.Replace("v", "").Trim();
+
+                    if (System.Version.TryParse(cleanLocalStr, out System.Version localVer) && 
+                        System.Version.TryParse(remoteVersionStr, out System.Version remoteVer))
+                    {
+                        if (remoteVer > localVer)
+                        {
+                            updateAvailable = true;
+                        }
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    Debug.LogWarning($"[Booth SDK] Error parsing GitHub response: {ex.Message}");
+                }
+            }
+        }
+        
+        updateCheckDone = true;
+        
+        if (this != null) Repaint();
+    }
+
+    [System.Serializable]
+    private class PackageJsonData
+    {
+        public string version;
+    }
+
+    [System.Serializable]
+    private class GithubReleaseData
+    {
+        public string tag_name;
+    }
+
     private async Task UploadToServer(byte[] packageData, BoothDescriptor descriptor)
     {
         WWWForm form = new WWWForm();
