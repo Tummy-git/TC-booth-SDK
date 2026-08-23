@@ -254,7 +254,7 @@ public class BoothExporterWindow : EditorWindow
                 return;
             }
 
-            string[] codeGuids = AssetDatabase.FindAssets("t:MonoScript t:AssemblyDefinitionAsset", new[] { userRootFolder });
+            string[] codeGuids = AssetDatabase.FindAssets("t:MonoScript t:AssemblyDefinitionAsset t:UdonSharpAssemblyDefinition", new[] { userRootFolder });
             foreach (string guid in codeGuids)
             {
                 string path = AssetDatabase.GUIDToAssetPath(guid);
