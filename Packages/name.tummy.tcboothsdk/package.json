@@ -1,7 +1,7 @@
 {
   "name": "name.tummy.tcboothsdk",
   "displayName": "TummyCon booth SDK",
-  "version": "0.0.18",
+  "version": "0.0.20",
   "description": "This package contains the TummyCon booth uploader.",
   "gitDependencies": {},
   "vpmDependencies": {
