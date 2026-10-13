@@ -1,11 +1,11 @@
 {
   "name": "name.tummy.tcboothsdk",
   "displayName": "TummyCon booth SDK",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "This package contains the TummyCon booth uploader.",
   "gitDependencies": {},
   "vpmDependencies": {
-    "com.vrchat.worlds": "3.10.4"
+    "com.vrchat.worlds": "^3.10.4"
   },
   "author": {
     "name": "tummy",
