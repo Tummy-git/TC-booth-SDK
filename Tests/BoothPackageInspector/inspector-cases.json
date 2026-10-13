@@ -1,0 +1,111 @@
+{
+  "_comment": "Shared test cases for the package inspector. An identical copy lives in both repos: booth-uploader/test/inspector-cases.json (server, packageInspector.js) and TC-booth-SDK/Tests/BoothPackageInspector/inspector-cases.json (SDK, BoothPackageInspector.cs). Keep them the same so both implementations are held to the same rules. entries: path + content (null content = folder). prefix: put in front of every tar entry name. rawEntries: extra tar entries (type file|symlink). raw: write this text instead of a package. expect.errors: one substring per expected error (exact count). expect.flags: flagged path -> exact list of reasons.",
+  "cases": [
+    {
+      "name": "clean booth passes",
+      "creator": "bob",
+      "entries": [
+        { "path": "Assets/Booth/bob", "content": null },
+        { "path": "Assets/Booth/bob/Booth.prefab", "content": "%YAML 1.1" },
+        { "path": "Assets/Booth/bob/Spin.cs", "content": "using UdonSharp;\nusing UnityEngine;\npublic class Spin : UdonSharpBehaviour\n{\n    void Update() { transform.Rotate(0, 1, 0); }\n}\n" }
+      ],
+      "expect": { "errors": [], "flags": {}, "scripts": 1 }
+    },
+    {
+      "name": "packages repacked with ./ prefixes are still inspected",
+      "creator": "bob",
+      "prefix": "./",
+      "entries": [
+        { "path": "Assets/Booth/bob/Booth.prefab", "content": "%YAML 1.1" },
+        { "path": "Assets/Booth/bob/Plugins/Evil.dll", "content": "MZ" }
+      ],
+      "expect": { "errors": ["compiled or executable code"], "flags": {}, "scripts": 0 }
+    },
+    {
+      "name": "files in another creator's folder are rejected, including name-prefix siblings",
+      "creator": "bob",
+      "entries": [
+        { "path": "Assets/Booth/alice/Steal.prefab", "content": "x" },
+        { "path": "Assets/Booth/bobby/Steal.mat", "content": "x" },
+        { "path": "Assets/Editor/Evil.cs", "content": "class E {}" }
+      ],
+      "expect": { "errors": ["outside", "outside", "outside"], "flags": {}, "scripts": 0 }
+    },
+    {
+      "name": "path tricks are rejected",
+      "creator": "bob",
+      "entries": [
+        { "path": "Assets/Booth/bob/../../Editor/Evil.cs", "content": "class E {}" },
+        { "path": "Assets/Booth/bob\\..\\..\\Evil.cs", "content": "class E {}" },
+        { "path": "/Assets/Booth/bob/Abs.prefab", "content": "x" },
+        { "path": "C:/Assets/Booth/bob/Drive.prefab", "content": "x" }
+      ],
+      "expect": { "errors": ["invalid destination path", "invalid destination path", "invalid destination path", "invalid destination path"], "flags": {}, "scripts": 0 }
+    },
+    {
+      "name": "compiled and executable code is rejected",
+      "creator": "bob",
+      "entries": [
+        { "path": "Assets/Booth/bob/Plugins/Helper.dll", "content": "MZ" },
+        { "path": "Assets/Booth/bob/Plugins/HELPER2.DLL", "content": "MZ" },
+        { "path": "Assets/Booth/bob/csc.rsp", "content": "-unsafe" },
+        { "path": "Assets/Booth/bob/Mac.bundle/Contents/MacOS/Mac", "content": "x" },
+        { "path": "Assets/Booth/bob/run.bat", "content": "calc" },
+        { "path": "Assets/Booth/bob/libnative.so", "content": "x" }
+      ],
+      "expect": { "errors": ["compiled or executable code", "compiled or executable code", "compiled or executable code", "compiled or executable code", "compiled or executable code", "compiled or executable code"], "flags": {}, "scripts": 0 }
+    },
+    {
+      "name": "suspicious scripts and editor code are flagged, clean scripts are not",
+      "creator": "bob",
+      "entries": [
+        { "path": "Assets/Booth/bob/Editor/Tool.cs", "content": "using UnityEditor;\n[InitializeOnLoad]\nclass Tool\n{\n    static Tool() { System.Diagnostics.Process.Start(\"calc\"); }\n}\n" },
+        { "path": "Assets/Booth/bob/Net.cs", "content": "using System.Net;\nclass Net\n{\n    void A() { new WebClient(); System.IO.File.ReadAllText(\"x\"); }\n}\n" },
+        { "path": "Assets/Booth/bob/Native.cs", "content": "using System.Runtime.InteropServices;\nclass Native\n{\n    [DllImport(\"user32\")] static extern int MessageBox(int h, string t, string c, int f);\n}\n" },
+        { "path": "Assets/Booth/bob/Loader.cs", "content": "class Loader\n{\n    void A() { System.Reflection.Assembly.Load(System.Convert.FromBase64String(\"AAAA\")); }\n}\n" },
+        { "path": "Assets/Booth/bob/Ed.asmdef", "content": "{ \"name\": \"Ed\", \"includePlatforms\": [\"Editor\"], \"allowUnsafeCode\": true }" },
+        { "path": "Assets/Booth/bob/Runtime.asmdef", "content": "{ \"name\": \"Runtime\", \"references\": [\"UdonSharp.Runtime\"] }" },
+        { "path": "Assets/Booth/bob/Spin.cs", "content": "using UdonSharp;\npublic class Spin : UdonSharpBehaviour { }\n" }
+      ],
+      "expect": {
+        "errors": [],
+        "flags": {
+          "Assets/Booth/bob/Editor/Tool.cs": ["in an Editor folder (runs in the Unity editor)", "starts processes (System.Diagnostics)", "runs in the Unity editor (UnityEditor)"],
+          "Assets/Booth/bob/Net.cs": ["network access", "file system access (System.IO)"],
+          "Assets/Booth/bob/Native.cs": ["native code interop"],
+          "Assets/Booth/bob/Loader.cs": ["reflection / dynamic code loading", "encoded data (base64)"],
+          "Assets/Booth/bob/Ed.asmdef": ["editor-only assembly (runs in the Unity editor)", "allows unsafe code"]
+        },
+        "scripts": 5
+      }
+    },
+    {
+      "name": "symlinks inside the archive are rejected",
+      "creator": "bob",
+      "entries": [
+        { "path": "Assets/Booth/bob/Booth.prefab", "content": "x" }
+      ],
+      "rawEntries": [
+        { "name": "0123456789abcdef0123456789abcdef/asset", "type": "symlink", "linkName": "/etc/passwd" }
+      ],
+      "expect": { "errors": ["Unexpected entry type"], "flags": {}, "scripts": 0 }
+    },
+    {
+      "name": "a package without any assets is rejected",
+      "creator": "bob",
+      "entries": [
+        { "path": "Assets/Booth/bob", "content": null }
+      ],
+      "rawEntries": [
+        { "name": "readme.txt", "type": "file", "content": "nothing here" }
+      ],
+      "expect": { "errors": ["no assets"], "flags": {}, "scripts": 0 }
+    },
+    {
+      "name": "a file that is not a package is rejected",
+      "creator": "bob",
+      "raw": "this is not a unitypackage",
+      "expect": { "errors": ["not a valid .unitypackage"], "flags": {}, "scripts": 0 }
+    }
+  ]
+}

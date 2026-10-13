@@ -1,0 +1,4 @@
+bin/
+obj/
+# The root .gitignore skips Unity-generated .csproj files; this one is hand-written
+!BoothPackageInspector.Tests.csproj
