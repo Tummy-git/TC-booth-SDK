@@ -2,12 +2,21 @@ using UnityEngine;
 using UnityEditor;
 using System.IO;
 using System.Collections.Generic;
-using System.Text.RegularExpressions;
+using Newtonsoft.Json.Linq;
 
 public class BoothAdminWindow : EditorWindow
 {
-    private List<string> masterPackages = new List<string>();
-    private Dictionary<string, List<string>> missingPackagesPerBooth = new Dictionary<string, List<string>>();
+    private const string BoothAssetRoot = "Assets/Booth";
+
+    private class PackageIssue
+    {
+        public string name;
+        public string requiredVersion;
+        public string installedVersion; // null = not installed
+    }
+
+    private Dictionary<string, List<PackageIssue>> issuesPerBooth = new Dictionary<string, List<PackageIssue>>();
+    private List<string> unreadableManifests = new List<string>();
     private Vector2 scrollPos;
 
     [MenuItem("Booth SDK/Admin/Check VPM Dependencies")]
@@ -33,7 +42,12 @@ public class BoothAdminWindow : EditorWindow
 
         EditorGUILayout.Space();
 
-        if (missingPackagesPerBooth.Count == 0)
+        foreach (string path in unreadableManifests)
+        {
+            EditorGUILayout.HelpBox($"Could not read {path}. See the Console for details.", MessageType.Error);
+        }
+
+        if (issuesPerBooth.Count == 0)
         {
             GUILayout.Label("✅ All imported booths have their required VPM packages installed.", EditorStyles.boldLabel);
             return;
@@ -41,24 +55,28 @@ public class BoothAdminWindow : EditorWindow
 
         scrollPos = EditorGUILayout.BeginScrollView(scrollPos);
 
-        foreach (var kvp in missingPackagesPerBooth)
+        foreach (var kvp in issuesPerBooth)
         {
             string boothName = kvp.Key;
-            List<string> missingPkgs = kvp.Value;
+            List<PackageIssue> issues = kvp.Value;
 
-            if (missingPkgs.Count == 0) continue;
+            if (issues.Count == 0) continue;
 
             EditorGUILayout.BeginVertical(GUI.skin.box);
-            GUILayout.Label($"⚠️ Missing packages in: {boothName}", EditorStyles.boldLabel);
-            
-            foreach (string pkg in missingPkgs)
+            GUILayout.Label($"⚠️ Package issues in: {boothName}", EditorStyles.boldLabel);
+
+            foreach (PackageIssue issue in issues)
             {
+                bool isMissing = issue.installedVersion == null;
+
                 GUILayout.BeginHorizontal();
-                GUILayout.Label($"- {pkg}");
-                
-                if (GUILayout.Button("Copy Install Command", GUILayout.Width(180)))
+                GUILayout.Label(isMissing
+                    ? $"- {issue.name} (missing, booth uses {issue.requiredVersion})"
+                    : $"- {issue.name} (installed {issue.installedVersion}, booth uses {issue.requiredVersion})");
+
+                if (GUILayout.Button(isMissing ? "Copy Install Command" : "Copy Upgrade Command", GUILayout.Width(180)))
                 {
-                    string command = $"vrc-get install {pkg}";
+                    string command = isMissing ? $"vrc-get install {issue.name}" : $"vrc-get upgrade {issue.name}";
                     GUIUtility.systemCopyBuffer = command;
                     Debug.Log($"[Booth Admin] Copied to clipboard: {command}");
                     EditorUtility.DisplayDialog("Command Copied", $"Open your command prompt or terminal in your Master Project folder and paste:\n\n{command}", "OK");
@@ -74,75 +92,103 @@ public class BoothAdminWindow : EditorWindow
 
     private void RefreshData()
     {
-        masterPackages.Clear();
-        missingPackagesPerBooth.Clear();
+        issuesPerBooth.Clear();
+        unreadableManifests.Clear();
 
-        // 1. Read Master Project Manifest
+        // 1. Read Master Project Manifest. "locked" lists everything actually installed, including
+        // packages pulled in as dependencies of other packages.
+        Dictionary<string, string> installed = new Dictionary<string, string>();
         string masterManifestPath = "Packages/vpm-manifest.json";
         if (File.Exists(masterManifestPath))
         {
-            masterPackages = ExtractPackagesFromManifest(File.ReadAllText(masterManifestPath));
+            if (!TryReadManifest(masterManifestPath, out JObject master)) return;
+            foreach (var pkg in ReadPackageSection(master, "dependencies")) installed[pkg.Key] = pkg.Value;
+            foreach (var pkg in ReadPackageSection(master, "locked")) installed[pkg.Key] = pkg.Value;
         }
 
         // 2. Find all imported Booth Manifests
-        string[] guids = AssetDatabase.FindAssets("*_VPM t:TextAsset");
+        if (!AssetDatabase.IsValidFolder(BoothAssetRoot)) return;
+
+        string[] guids = AssetDatabase.FindAssets("t:TextAsset", new[] { BoothAssetRoot });
         foreach (string guid in guids)
         {
             string path = AssetDatabase.GUIDToAssetPath(guid);
-            string jsonContent = File.ReadAllText(path);
-            
-            List<string> boothPackages = ExtractPackagesFromManifest(jsonContent);
-            List<string> missing = new List<string>();
+            if (!path.EndsWith("_VPM.json")) continue;
+            if (!TryReadManifest(path, out JObject boothManifest)) continue;
 
-            foreach (string pkg in boothPackages)
+            List<PackageIssue> issues = new List<PackageIssue>();
+
+            // Only the packages the creator installed directly; their own dependencies come along when installing them
+            foreach (var pkg in ReadPackageSection(boothManifest, "dependencies"))
             {
                 // Ignore base VRChat packages as they are guaranteed to exist or conflict
-                if (pkg.StartsWith("com.vrchat.")) continue;
+                if (pkg.Key.StartsWith("com.vrchat.")) continue;
 
-                if (!masterPackages.Contains(pkg))
+                if (!installed.TryGetValue(pkg.Key, out string installedVersion))
                 {
-                    missing.Add(pkg);
+                    issues.Add(new PackageIssue { name = pkg.Key, requiredVersion = pkg.Value, installedVersion = null });
+                }
+                else if (IsOlderVersion(installedVersion, pkg.Value))
+                {
+                    issues.Add(new PackageIssue { name = pkg.Key, requiredVersion = pkg.Value, installedVersion = installedVersion });
                 }
             }
 
-            if (missing.Count > 0)
+            if (issues.Count > 0)
             {
                 string boothName = Path.GetFileNameWithoutExtension(path).Replace("_VPM", "");
-                missingPackagesPerBooth[boothName] = missing;
+                issuesPerBooth[boothName] = issues;
             }
         }
     }
 
-    // A lightweight string parser to extract packages without needing heavy JSON libraries
-    private List<string> ExtractPackagesFromManifest(string jsonContent)
+    private bool TryReadManifest(string path, out JObject manifest)
     {
-        List<string> packages = new List<string>();
-        bool insideDependencies = false;
-
-        string[] lines = jsonContent.Split('\n');
-        foreach (string line in lines)
+        try
         {
-            if (line.Contains("\"dependencies\": {")) 
-            { 
-                insideDependencies = true; 
-                continue; 
-            }
-            
-            if (insideDependencies && line.Contains("}")) 
-            { 
-                break; 
-            }
+            manifest = JObject.Parse(File.ReadAllText(path));
+            return true;
+        }
+        catch (System.Exception ex)
+        {
+            Debug.LogError($"[Booth Admin] Could not parse VPM manifest '{path}': {ex.Message}");
+            unreadableManifests.Add(path);
+            manifest = null;
+            return false;
+        }
+    }
 
-            if (insideDependencies)
-            {
-                // Matches "com.creator.package": "^1.0.0"
-                Match match = Regex.Match(line, @"\""(?<pkg>[\w\.\-]+)\""\s*:");
-                if (match.Success)
-                {
-                    packages.Add(match.Groups["pkg"].Value);
-                }
-            }
+    // Returns package name -> version for "dependencies" or "locked".
+    // Entries look like "com.x": { "version": "1.0.0", ... }.
+    private static Dictionary<string, string> ReadPackageSection(JObject manifest, string section)
+    {
+        Dictionary<string, string> packages = new Dictionary<string, string>();
+        if (!(manifest[section] is JObject entries)) return packages;
+
+        foreach (JProperty entry in entries.Properties())
+        {
+            string version = entry.Value.Type == JTokenType.Object
+                ? (string)entry.Value["version"]
+                : (string)entry.Value;
+            packages[entry.Name] = version ?? "?";
         }
         return packages;
+    }
+
+    // Compares the numeric part only ("1.2.3-beta.1" -> 1.2.3). Unparseable versions are never reported as older.
+    private static bool IsOlderVersion(string installed, string required)
+    {
+        if (TryParseVersion(installed, out System.Version installedVer) && TryParseVersion(required, out System.Version requiredVer))
+        {
+            return installedVer < requiredVer;
+        }
+        return false;
+    }
+
+    private static bool TryParseVersion(string versionStr, out System.Version version)
+    {
+        string clean = (versionStr ?? "").Split('-', '+')[0].Trim();
+        if (!clean.Contains(".")) clean += ".0";
+        return System.Version.TryParse(clean, out version);
     }
 }
