@@ -5,6 +5,7 @@ using System.IO;
 using System.Threading.Tasks;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 
 public class BoothAdminDownloader : EditorWindow
 {
@@ -17,6 +18,17 @@ public class BoothAdminDownloader : EditorWindow
     private const string DownloadTempPath = "Temp/BoothDownloads";
     private const string BoothAssetRoot = "Assets/Booth";
     private const string TrackingFilePath = "ProjectSettings/BoothSDK_DownloadHistory.json";
+    // Downloaded but not yet imported. Moved into the history only once Unity reports the import as completed,
+    // so a failed import is downloaded again on the next sync.
+    private const string PendingImportsPath = "Temp/BoothSDK_PendingImports.json";
+
+    [InitializeOnLoadMethod]
+    private static void RegisterImportCallbacks()
+    {
+        AssetDatabase.importPackageCompleted += OnImportPackageCompleted;
+        AssetDatabase.importPackageFailed += OnImportPackageFailed;
+        AssetDatabase.importPackageCancelled += OnImportPackageCancelled;
+    }
 
     [MenuItem("Booth SDK/Admin/Admin Downloader")]
     public static void ShowWindow()
@@ -131,7 +143,7 @@ public class BoothAdminDownloader : EditorWindow
                 while (!op.isDone) await Task.Delay(50);
 
                 if (req.result != UnityWebRequest.Result.Success)
-                    throw new System.Exception($"Failed to get booth list: {req.error}");
+                    throw new System.Exception($"Failed to get booth list: {DescribeError(req)}");
 
                 string wrappedJson = "{ \"booths\": " + req.downloadHandler.text + " }";
                 wrapper = JsonUtility.FromJson<BoothListWrapper>(wrappedJson);
@@ -147,23 +159,22 @@ public class BoothAdminDownloader : EditorWindow
             // 2. Load History & Clean Temp Folder
             DownloadHistory history = LoadHistory();
             CleanTempDownloadsFolder();
-            
+
             int downloadedCount = 0;
-            List<string> foldersToDelete = new List<string>();
 
             // PHASE 1: BATCH CHECK & DOWNLOAD
             for (int i = 0; i < wrapper.booths.Count; i++)
             {
                 BoothEntry booth = wrapper.booths[i];
                 float progress = 0.2f + (0.5f * ((float)i / wrapper.booths.Count));
-                
-                string safeCreator = string.Join("_", booth.creator.Split(Path.GetInvalidFileNameChars()));
+
+                if (!TryGetSafeNames(booth, out string safeCreator, out string safeFilename)) continue;
                 HistoryRecord existingRecord = history.records.FirstOrDefault(r => r.creator == safeCreator);
 
                 // Check: Has the file changed?
-                if (existingRecord != null && existingRecord.lastFilename == booth.filename)
+                if (existingRecord != null && existingRecord.lastFilename == safeFilename)
                 {
-                    Debug.Log($"[Smart Sync] Skipping {booth.creator} (Already up to date)");
+                    Debug.Log($"[Smart Sync] Skipping {safeCreator} (Already up to date)");
                     continue;
                 }
 
@@ -179,49 +190,46 @@ public class BoothAdminDownloader : EditorWindow
 
                     if (dlReq.result == UnityWebRequest.Result.Success)
                     {
-                        string savePath = Path.Combine(DownloadTempPath, booth.filename);
+                        string savePath = Path.Combine(DownloadTempPath, safeFilename);
                         File.WriteAllBytes(savePath, dlReq.downloadHandler.data);
                         downloadedCount++;
 
-                        // Only mark the folder for deletion if the download ACTUALLY succeeded
-                        string userFolder = $"{BoothAssetRoot}/{safeCreator}";
-                        if (AssetDatabase.IsValidFolder(userFolder))
-                        {
-                            foldersToDelete.Add(userFolder);
-                        }
-
-                        // Update History
-                        if (existingRecord != null) existingRecord.lastFilename = booth.filename;
-                        else history.records.Add(new HistoryRecord { creator = safeCreator, lastFilename = booth.filename });
+                        // History is updated once the import completes (see OnImportPackageCompleted)
+                        AddPendingImport(safeCreator, safeFilename);
                     }
                     else
                     {
-                        Debug.LogError($"[Smart Sync] Failed to download {booth.filename}: {dlReq.error}");
+                        Debug.LogError($"[Smart Sync] Failed to download {safeFilename}: {DescribeError(dlReq)}");
                     }
                 }
             }
 
-            // Save history right after downloads finish
-            SaveHistory(history);
-
             if (downloadedCount > 0)
             {
-                // PHASE 2: BATCH DELETE
+                // PHASE 2: REVIEW. Before deleting anything, so a skipped booth keeps its current version.
+                EditorUtility.ClearProgressBar();
+                List<(string creator, string packagePath)> approved = ReviewDownloadedPackages();
+
+                // PHASE 3: BATCH DELETE (only booths that are about to be replaced)
                 EditorUtility.DisplayProgressBar("Smart Sync", "Cleaning up outdated folders...", 0.75f);
-                foreach (string folder in foldersToDelete)
+                foreach (var (creator, _) in approved)
                 {
-                    Debug.Log($"[Smart Sync] Deleting outdated folder: {folder}");
-                    AssetDatabase.DeleteAsset(folder);
+                    string userFolder = $"{BoothAssetRoot}/{creator}";
+                    if (AssetDatabase.IsValidFolder(userFolder))
+                    {
+                        Debug.Log($"[Smart Sync] Deleting outdated folder: {userFolder}");
+                        AssetDatabase.DeleteAsset(userFolder);
+                    }
                 }
 
                 EditorUtility.DisplayProgressBar("Smart Sync", "Refreshing Asset Database...", 0.85f);
-                AssetDatabase.Refresh(); 
-                
-                // PHASE 3: BATCH IMPORT
+                AssetDatabase.Refresh();
+
+                // PHASE 4: BATCH IMPORT
                 EditorUtility.DisplayProgressBar("Smart Sync", "Importing new packages...", 0.95f);
-                ImportDownloadedPackages();
-                
-                Debug.Log($"[Smart Sync] Complete! Downloaded and queued {downloadedCount} new updates for import.");
+                ImportPackages(approved.Select(a => a.packagePath).ToList());
+
+                Debug.Log($"[Smart Sync] Complete! Downloaded {downloadedCount} updates, queued {approved.Count} for import.");
             }
             else
             {
@@ -252,22 +260,120 @@ public class BoothAdminDownloader : EditorWindow
         {
             Directory.CreateDirectory(DownloadTempPath);
         }
+
+        // The packages these pointed to were just deleted
+        if (File.Exists(PendingImportsPath)) File.Delete(PendingImportsPath);
     }
 
-    private DownloadHistory LoadHistory()
+    // The server explains failures (wrong login, account locked, rate limited) in the response body
+    private static string DescribeError(UnityWebRequest req)
     {
-        if (File.Exists(TrackingFilePath))
+        string serverMessage = null;
+        try { serverMessage = req.downloadHandler?.text?.Trim(); } catch { }
+        if (string.IsNullOrEmpty(serverMessage)) return req.error;
+        if (serverMessage.Length > 300) serverMessage = serverMessage.Substring(0, 300) + "...";
+        return $"{serverMessage} ({req.error})";
+    }
+
+    // The server only creates [a-zA-Z0-9_-] creator folders and plain .unitypackage names.
+    // Anything else (e.g. "..\" or an absolute path) is rejected so it can't write outside the intended folders.
+    private static bool TryGetSafeNames(BoothEntry booth, out string safeCreator, out string safeFilename)
+    {
+        safeCreator = booth.creator ?? "";
+        safeFilename = Path.GetFileName(booth.filename ?? "");
+
+        bool creatorOk = Regex.IsMatch(safeCreator, @"^[a-zA-Z0-9_-]+$");
+        bool filenameOk = safeFilename == booth.filename &&
+                          safeFilename.EndsWith(".unitypackage", System.StringComparison.OrdinalIgnoreCase) &&
+                          safeFilename.IndexOfAny(Path.GetInvalidFileNameChars()) < 0;
+
+        if (!creatorOk || !filenameOk)
         {
-            string json = File.ReadAllText(TrackingFilePath);
+            Debug.LogError($"[Booth Admin] Skipping booth with unexpected creator/filename from server: '{booth.creator}' / '{booth.filename}'");
+            return false;
+        }
+        return true;
+    }
+
+    private static DownloadHistory LoadHistory()
+    {
+        return LoadRecords(TrackingFilePath);
+    }
+
+    private static void SaveHistory(DownloadHistory history)
+    {
+        SaveRecords(TrackingFilePath, history);
+    }
+
+    private static DownloadHistory LoadRecords(string filePath)
+    {
+        if (File.Exists(filePath))
+        {
+            string json = File.ReadAllText(filePath);
             return JsonUtility.FromJson<DownloadHistory>(json) ?? new DownloadHistory();
         }
         return new DownloadHistory();
     }
 
-    private void SaveHistory(DownloadHistory history)
+    private static void SaveRecords(string filePath, DownloadHistory records)
     {
-        string json = JsonUtility.ToJson(history, true);
-        File.WriteAllText(TrackingFilePath, json);
+        string json = JsonUtility.ToJson(records, true);
+        File.WriteAllText(filePath, json);
+    }
+
+    private static void SetRecord(DownloadHistory records, string creator, string filename)
+    {
+        HistoryRecord existingRecord = records.records.FirstOrDefault(r => r.creator == creator);
+        if (existingRecord != null) existingRecord.lastFilename = filename;
+        else records.records.Add(new HistoryRecord { creator = creator, lastFilename = filename });
+    }
+
+    private static void AddPendingImport(string creator, string filename)
+    {
+        DownloadHistory pending = LoadRecords(PendingImportsPath);
+        SetRecord(pending, creator, filename);
+        SaveRecords(PendingImportsPath, pending);
+    }
+
+    // Removes and returns the pending record for an imported package, or null if it isn't one of ours
+    private static HistoryRecord TakePendingImport(string packageName)
+    {
+        if (!File.Exists(PendingImportsPath)) return null;
+
+        DownloadHistory pending = LoadRecords(PendingImportsPath);
+        string name = Path.GetFileNameWithoutExtension(packageName);
+        HistoryRecord record = pending.records.FirstOrDefault(r => Path.GetFileNameWithoutExtension(r.lastFilename) == name);
+        if (record != null)
+        {
+            pending.records.Remove(record);
+            SaveRecords(PendingImportsPath, pending);
+        }
+        return record;
+    }
+
+    private static void OnImportPackageCompleted(string packageName)
+    {
+        HistoryRecord record = TakePendingImport(packageName);
+        if (record == null) return;
+
+        DownloadHistory history = LoadHistory();
+        SetRecord(history, record.creator, record.lastFilename);
+        SaveHistory(history);
+        Debug.Log($"[Booth Admin] Imported {record.lastFilename}, marked as up to date.");
+    }
+
+    private static void OnImportPackageFailed(string packageName, string errorMessage)
+    {
+        HistoryRecord record = TakePendingImport(packageName);
+        if (record == null) return;
+        Debug.LogError($"[Booth Admin] Import of {record.lastFilename} failed: {errorMessage}. It will be downloaded again on the next sync.");
+    }
+
+    private static void OnImportPackageCancelled(string packageName)
+    {
+        HistoryRecord record = TakePendingImport(packageName);
+        if (record == null) return;
+        Debug.LogWarning($"[Booth Admin] Import of {record.lastFilename} was cancelled. It will be downloaded again on the next sync.");
     }
     // ==========================================
 
@@ -277,11 +383,17 @@ public class BoothAdminDownloader : EditorWindow
     // ==========================================
     private void DeleteExistingBooths()
     {
-        Debug.Log("[Booth Admin] Starting deletion of existing booth assets...");
-
         if (AssetDatabase.IsValidFolder(BoothAssetRoot))
         {
             string[] subfolders = AssetDatabase.GetSubFolders(BoothAssetRoot);
+            if (!EditorUtility.DisplayDialog("Delete All Booth Assets?",
+                    $"This permanently deletes all {subfolders.Length} folders under {BoothAssetRoot} and clears the download history.\n\nThis cannot be undone.",
+                    "Delete", "Cancel"))
+            {
+                return;
+            }
+
+            Debug.Log("[Booth Admin] Starting deletion of existing booth assets...");
             foreach (string folder in subfolders)
             {
                 Debug.Log($"[Booth Admin] Deleting folder: {folder}");
@@ -312,13 +424,22 @@ public class BoothAdminDownloader : EditorWindow
             return;
         }
 
+        if (!EditorUtility.DisplayDialog("Delete Booths From Scene?",
+                $"This removes all {existingInScene.Length} booths from the open scene.\n\nYou can undo this with Ctrl+Z.",
+                "Delete", "Cancel"))
+        {
+            return;
+        }
+
         int count = 0;
         foreach (var desc in existingInScene)
         {
-            DestroyImmediate(desc.gameObject);
+            if (desc == null) continue; // Already destroyed together with a parent booth
+            Undo.DestroyObjectImmediate(desc.gameObject);
             count++;
         }
-        
+        Undo.SetCurrentGroupName("Delete Booths From Scene");
+
         Debug.Log($"[Booth Admin] Cleared {count} booths from the scene.");
     }
 
@@ -350,7 +471,7 @@ public class BoothAdminDownloader : EditorWindow
 
                 if (req.result != UnityWebRequest.Result.Success)
                 {
-                    throw new System.Exception($"Failed to get booth list: {req.error}\n(Check your admin credentials)");
+                    throw new System.Exception($"Failed to get booth list: {DescribeError(req)}");
                 }
 
                 string jsonResponse = req.downloadHandler.text;
@@ -368,15 +489,16 @@ public class BoothAdminDownloader : EditorWindow
                 Debug.Log($"[Booth Admin] Found {wrapper.booths.Count} booths to download.");
 
                 CleanTempDownloadsFolder();
-                DownloadHistory history = LoadHistory();
 
                 for (int i = 0; i < wrapper.booths.Count; i++)
                 {
                     BoothEntry booth = wrapper.booths[i];
                     float progress = 0.2f + (0.8f * ((float)i / wrapper.booths.Count));
-                    
-                    EditorUtility.DisplayProgressBar("Admin Downloader", $"Downloading {booth.filename}...", progress);
-                    Debug.Log($"[Booth Admin] Downloading: {booth.filename}");
+
+                    if (!TryGetSafeNames(booth, out string safeCreator, out string safeFilename)) continue;
+
+                    EditorUtility.DisplayProgressBar("Admin Downloader", $"Downloading {safeFilename}...", progress);
+                    Debug.Log($"[Booth Admin] Downloading: {safeFilename}");
 
                     using (UnityWebRequest dlReq = UnityWebRequest.Get(booth.downloadUrl))
                     {
@@ -388,24 +510,20 @@ public class BoothAdminDownloader : EditorWindow
 
                         if (dlReq.result == UnityWebRequest.Result.Success)
                         {
-                            string savePath = Path.Combine(DownloadTempPath, booth.filename);
+                            string savePath = Path.Combine(DownloadTempPath, safeFilename);
                             File.WriteAllBytes(savePath, dlReq.downloadHandler.data);
                             Debug.Log($"[Booth Admin] Saved to: {savePath}");
-                            
-                            // Update history even on manual force download
-                            string safeCreator = string.Join("_", booth.creator.Split(Path.GetInvalidFileNameChars()));
-                            HistoryRecord existingRecord = history.records.FirstOrDefault(r => r.creator == safeCreator);
-                            if (existingRecord != null) existingRecord.lastFilename = booth.filename;
-                            else history.records.Add(new HistoryRecord { creator = safeCreator, lastFilename = booth.filename });
+
+                            // History is updated once the import completes (see OnImportPackageCompleted)
+                            AddPendingImport(safeCreator, safeFilename);
                         }
                         else
                         {
-                            Debug.LogError($"[Booth Admin] Failed to download {booth.filename}: {dlReq.error}");
+                            Debug.LogError($"[Booth Admin] Failed to download {safeFilename}: {DescribeError(dlReq)}");
                         }
                     }
                 }
-                
-                SaveHistory(history);
+
                 Debug.Log("[Booth Admin] All downloads finished.");
             }
         }
@@ -431,14 +549,109 @@ public class BoothAdminDownloader : EditorWindow
             return;
         }
 
-        string[] packages = Directory.GetFiles(DownloadTempPath, "*.unitypackage");
-        if (packages.Length == 0)
+        if (Directory.GetFiles(DownloadTempPath, "*.unitypackage").Length == 0)
         {
             Debug.LogWarning("[Booth Admin] No .unitypackage files found in the Temp directory.");
             return;
         }
 
-        Debug.Log($"[Booth Admin] Starting import of {packages.Length} packages...");
+        ImportPackages(ReviewDownloadedPackages().Select(a => a.packagePath).ToList());
+    }
+
+    // Inspects every downloaded package (see BoothPackageInspector) and asks about anything that needs review.
+    // Blocked and skipped packages are removed from the download folder; the approved ones are returned.
+    private List<(string creator, string packagePath)> ReviewDownloadedPackages()
+    {
+        List<(string creator, string packagePath)> approved = new List<(string, string)>();
+        DownloadHistory pending = LoadRecords(PendingImportsPath);
+
+        foreach (string packagePath in Directory.GetFiles(DownloadTempPath, "*.unitypackage"))
+        {
+            string filename = Path.GetFileName(packagePath);
+            HistoryRecord record = pending.records.FirstOrDefault(r => r.lastFilename == filename);
+            if (record == null)
+            {
+                Debug.LogError($"[Booth Admin] Don't know which creator {filename} belongs to. Download it again.");
+                DiscardPackage(packagePath);
+                continue;
+            }
+
+            EditorUtility.DisplayProgressBar("Booth Review", $"Inspecting {filename}...", 0.5f);
+            BoothPackageInspector.Report report = BoothPackageInspector.Inspect(packagePath, record.creator);
+            EditorUtility.ClearProgressBar();
+
+            if (report.errors.Count > 0)
+            {
+                Debug.LogError($"[Booth Admin] {filename} is BLOCKED and will not be imported:\n- " + string.Join("\n- ", report.errors));
+                EditorUtility.DisplayDialog($"Booth Blocked: {record.creator}",
+                    $"{filename} will not be imported:\n\n- " + string.Join("\n- ", report.errors.Take(10)) +
+                    (report.errors.Count > 10 ? $"\n...and {report.errors.Count - 10} more (see the Console)." : ""), "OK");
+                DiscardPackage(packagePath);
+                continue;
+            }
+
+            if (!report.NeedsReview)
+            {
+                Debug.Log($"[Booth Admin] {filename}: {report.scripts.Count} scripts, nothing flagged.");
+                approved.Add((record.creator, packagePath));
+                continue;
+            }
+
+            if (AskToImport(filename, record.creator, report))
+            {
+                approved.Add((record.creator, packagePath));
+            }
+            else
+            {
+                Debug.LogWarning($"[Booth Admin] Skipped {filename}. It will be offered again on the next sync.");
+                DiscardPackage(packagePath);
+            }
+        }
+        return approved;
+    }
+
+    private static bool AskToImport(string filename, string creator, BoothPackageInspector.Report report)
+    {
+        List<string> lines = new List<string>();
+        lines.AddRange(report.flags.Select(f => $"- {f.path.Replace($"Assets/Booth/{creator}/", "")}: {string.Join(", ", f.reasons)}"));
+        lines.AddRange(report.guidCollisions.Select(c => $"- ID collision: {c}"));
+
+        Debug.LogWarning($"[Booth Admin] {filename} needs review:\n" + string.Join("\n", lines));
+
+        string message = $"{filename}\n\n" + string.Join("\n", lines.Take(15)) +
+                         (lines.Count > 15 ? $"\n...and {lines.Count - 15} more (see the Console)." : "") +
+                         (report.guidCollisions.Count > 0 ? "\n\nID collisions: Unity will update the existing asset instead of adding a new one." : "");
+
+        while (true)
+        {
+            int choice = report.flaggedScriptContents.Count > 0
+                ? EditorUtility.DisplayDialogComplex($"Review Booth: {creator}", message, "Import", "Skip", "Show Flagged Scripts")
+                : (EditorUtility.DisplayDialog($"Review Booth: {creator}", message, "Import", "Skip") ? 0 : 1);
+
+            if (choice == 0) return true;
+            if (choice == 1) return false;
+
+            // Written outside Assets as .txt so Unity doesn't compile them
+            string reviewFolder = BoothPackageInspector.WriteFlaggedScriptsForReview(report, creator);
+            EditorUtility.RevealInFinder(reviewFolder);
+        }
+    }
+
+    private static void DiscardPackage(string packagePath)
+    {
+        TakePendingImport(Path.GetFileName(packagePath));
+        File.Delete(packagePath);
+    }
+
+    private void ImportPackages(List<string> packages)
+    {
+        if (packages.Count == 0)
+        {
+            Debug.Log("[Booth Admin] Nothing to import.");
+            return;
+        }
+
+        Debug.Log($"[Booth Admin] Starting import of {packages.Count} packages...");
 
         foreach (string pkg in packages)
         {

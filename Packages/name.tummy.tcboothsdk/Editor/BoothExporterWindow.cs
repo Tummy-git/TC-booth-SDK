@@ -1,6 +1,7 @@
 using UnityEngine;
 using UnityEditor;
 using UnityEngine.Networking;
+using UnityEngine.SceneManagement;
 using System.IO;
 using System.Threading.Tasks;
 using System.Collections.Generic;
@@ -18,7 +19,8 @@ public class BoothExporterWindow : EditorWindow
     private const string LimitsEndpoint = ServerBaseUrl + "/api/limits"; 
     
     private const string BackupFolderName = "BoothExports";
-    private const string ROOT_FOLDER = "Booth"; 
+    private const int MaxLocalBackups = 5;
+    private const string ROOT_FOLDER = "Booth";
 
     private const string PrefKey_User = "BoothSDK_Username";
     private const string PrefKey_Pass = "BoothSDK_Password";
@@ -33,7 +35,8 @@ public class BoothExporterWindow : EditorWindow
     private static string localVersionStr = "Unknown";
     private static string remoteVersionStr = "Unknown";
 
-    private Regex SHADER_INCLUDE_REGEX = new Regex(@"^\s*#\s*include\s*""(.*)""$");
+    // Matches #include and #include_with_pragmas, with or without a trailing comment
+    private Regex SHADER_INCLUDE_REGEX = new Regex(@"^\s*#\s*include(?:_with_pragmas)?\s*""([^""]+)""");
 
     [MenuItem("Booth SDK/Open Booth Exporter")]
     public static void ShowWindow()
@@ -77,12 +80,12 @@ public class BoothExporterWindow : EditorWindow
 
         if (GUILayout.Button("Spawn / Update Name Plate", GUILayout.Height(30)))
         {
-            BoothDescriptor desc = FindActiveBooth();
+            BoothDescriptor desc = FindActiveBooth(out bool canceled);
             if (desc != null)
             {
                 SpawnOrUpdateNamePlate(desc);
             }
-            else
+            else if (!canceled)
             {
                 EditorUtility.DisplayDialog("Error", "No active BoothDescriptor found in the scene to attach the plate to.", "OK");
             }
@@ -129,7 +132,7 @@ public class BoothExporterWindow : EditorWindow
 
         EditorGUILayout.Space();
         
-        GUILayout.Label("When you upload, the unitypackage is saved locally as well. Click below to find the folder.", wrapStyle);
+        GUILayout.Label($"When you upload, the unitypackage is saved locally as well (the last {MaxLocalBackups} exports are kept). Click below to find the folder.", wrapStyle);
         
         EditorGUILayout.Space();
 
@@ -196,7 +199,8 @@ public class BoothExporterWindow : EditorWindow
             return;
         }
 
-        BoothDescriptor descriptor = FindActiveBooth();
+        BoothDescriptor descriptor = FindActiveBooth(out bool canceled);
+        if (canceled) return;
         if (descriptor == null)
         {
             EditorUtility.DisplayDialog("Error", "No active BoothDescriptor found in the scene.", "OK");
@@ -206,6 +210,12 @@ public class BoothExporterWindow : EditorWindow
         if (!ValidateComponents(descriptor.gameObject, out string componentError))
         {
             EditorUtility.DisplayDialog("Component Violation", componentError, "OK");
+            return;
+        }
+
+        if (!ValidateShaders(descriptor.gameObject, out string shaderError))
+        {
+            EditorUtility.DisplayDialog("Missing Shaders", shaderError, "OK");
             return;
         }
 
@@ -246,13 +256,7 @@ public class BoothExporterWindow : EditorWindow
                 CleanGhostPropertiesInDependencies(prefabPath, userRootFolder);
             }
 
-            string dependencyError;
-            HashSet<string> dependencies = GetDependencies(prefabPath, out dependencyError);
-            if (dependencies == null)
-            {
-                EditorUtility.DisplayDialog("Dependency Error", dependencyError, "OK");
-                return;
-            }
+            HashSet<string> dependencies = GetDependencies(prefabPath);
 
             string[] codeGuids = AssetDatabase.FindAssets("t:MonoScript t:AssemblyDefinitionAsset t:UdonSharpAssemblyDefinition", new[] { userRootFolder });
             foreach (string guid in codeGuids)
@@ -264,6 +268,16 @@ public class BoothExporterWindow : EditorWindow
             if (!ValidateFolderStructure(dependencies, userRootFolder, out string folderError))
             {
                 EditorUtility.DisplayDialog("Folder Structure Error", folderError, "OK");
+                return;
+            }
+
+            // The server rejects these too; checking here saves the creator an upload
+            List<string> blockedFiles = dependencies.Where(BoothPackageInspector.HasBlockedExtension).ToList();
+            if (blockedFiles.Count > 0)
+            {
+                EditorUtility.DisplayDialog("Compiled Code Not Allowed",
+                    "Booths can't contain compiled or executable code (DLLs, native plugins, .rsp compiler files and similar). Remove these and try again:\n\n" +
+                    string.Join("\n", blockedFiles.Take(15)), "OK");
                 return;
             }
 
@@ -330,9 +344,8 @@ public class BoothExporterWindow : EditorWindow
         }
     }
 
-    private HashSet<string> GetDependencies(string prefabPath, out string errorMessage)
+    private HashSet<string> GetDependencies(string prefabPath)
     {
-        errorMessage = "";
         string[] rawDependencies = AssetDatabase.GetDependencies(prefabPath, true);
         HashSet<string> dependencies = new HashSet<string>(rawDependencies);
 
@@ -340,18 +353,24 @@ public class BoothExporterWindow : EditorWindow
         {
             if (dep.EndsWith(".shader") || dep.EndsWith(".orlshader") || dep.EndsWith(".cginc") || dep.EndsWith(".hlsl"))
             {
-                if (!GetShaderDependencies(dep, dependencies, out errorMessage)) return null;
+                GetShaderDependencies(dep, dependencies);
             }
+        }
+
+        List<string> skippedTmpAssets = dependencies.Where(dep => dep.StartsWith("Assets/TextMesh Pro/")).ToList();
+        if (skippedTmpAssets.Count > 0)
+        {
+            Debug.LogWarning($"[Booth SDK] {skippedTmpAssets.Count} asset(s) in 'Assets/TextMesh Pro/' are NOT included in the upload. " +
+                             "The master project uses the standard TMP Essentials. If you made custom fonts or font materials, move them into your booth folder:\n" +
+                             string.Join("\n", skippedTmpAssets));
         }
 
         dependencies.RemoveWhere(dep => ShouldSkipDependency(dep));
         return dependencies;
     }
 
-    private bool GetShaderDependencies(string dep, HashSet<string> dependencies, out string errorMessage)
+    private void GetShaderDependencies(string dep, HashSet<string> dependencies)
     {
-        errorMessage = "";
-
         foreach (string line in File.ReadLines(dep))
         {
             Match m = SHADER_INCLUDE_REGEX.Match(line);
@@ -366,15 +385,13 @@ public class BoothExporterWindow : EditorWindow
                     assetPath = Path.GetRelativePath(".", includeName);
                     if (!File.Exists(assetPath))
                     {
+                        // Shaders that actually fail to compile are blocked by ValidateShaders, so a
+                        // missing include here is usually inside an #if branch that is never used.
                         if (!File.Exists(Path.Join(EditorApplication.applicationContentsPath, "CGIncludes", includeName)))
                         {
-                            errorMessage = $"Cannot find dependency '{includeName}' included from '{dep}'";
-                            return false;
+                            Debug.LogWarning($"[Booth SDK] Cannot find '{includeName}' included from '{dep}'. It will not be part of the upload.");
                         }
-                        else
-                        {
-                            continue;
-                        }
+                        continue;
                     }
                 }
 
@@ -384,12 +401,11 @@ public class BoothExporterWindow : EditorWindow
                 {
                     if (dependencies.Add(assetPath))
                     {
-                        if (!GetShaderDependencies(assetPath, dependencies, out errorMessage)) return false;
+                        GetShaderDependencies(assetPath, dependencies);
                     }
                 }
             }
         }
-        return true;
     }
 
     private async Task<bool> CheckServerLimitsAsync(long localSizeBytes)
@@ -402,7 +418,19 @@ public class BoothExporterWindow : EditorWindow
             if (req.result == UnityWebRequest.Result.Success)
             {
                 ServerLimits limits = JsonUtility.FromJson<ServerLimits>(req.downloadHandler.text);
-                
+
+                string localVersion = ReadLocalSdkVersion();
+                if (!string.IsNullOrEmpty(limits.minSdkVersion) &&
+                    TryParseSdkVersion(localVersion, out System.Version localVer) &&
+                    TryParseSdkVersion(limits.minSdkVersion, out System.Version minVer) &&
+                    localVer < minVer)
+                {
+                    EditorUtility.DisplayDialog("SDK Update Required",
+                        $"Your Booth SDK is version {localVersion}, but the server requires version {limits.minSdkVersion} or newer.\n\n" +
+                        "Please update the 'TummyCon booth SDK' package in VCC / ALCOM and try again.", "OK");
+                    return false;
+                }
+
                 if (localSizeBytes > limits.maxSizeBytes)
                 {
                     float localSizeMb = localSizeBytes / (1024f * 1024f);
@@ -435,6 +463,7 @@ public class BoothExporterWindow : EditorWindow
     {
         public int maxSizeMb;
         public long maxSizeBytes;
+        public string minSdkVersion;
     }
 
     private bool ShouldSkipDependency(string dep)
@@ -485,12 +514,44 @@ public class BoothExporterWindow : EditorWindow
         return true;
     }
     
+    private bool ValidateShaders(GameObject rootObject, out string errorMessage)
+    {
+        errorMessage = "";
+        List<string> brokenMaterials = new List<string>();
+
+        foreach (Object dep in EditorUtility.CollectDependencies(new Object[] { rootObject }))
+        {
+            if (dep is Material mat && IsShaderBroken(mat.shader))
+            {
+                string shaderName = mat.shader != null ? mat.shader.name : "no shader";
+                brokenMaterials.Add($"- '{mat.name}' ({AssetDatabase.GetAssetPath(mat)}), shader: {shaderName}");
+            }
+        }
+
+        if (brokenMaterials.Count == 0) return true;
+
+        errorMessage = "These materials use a shader that is missing or fails to compile (they show up pink):\n\n" +
+                       string.Join("\n", brokenMaterials.Distinct().Take(15)) +
+                       (brokenMaterials.Count > 15 ? $"\n...and {brokenMaterials.Count - 15} more (see the Console)." : "") +
+                       "\n\nInstall the shader package, or assign a working shader, and try again.";
+        Debug.LogError("[Booth SDK] Materials with missing or broken shaders:\n" + string.Join("\n", brokenMaterials.Distinct()));
+        return false;
+    }
+
+    private static bool IsShaderBroken(Shader shader)
+    {
+        // A missing shader reference resolves to Hidden/InternalErrorShader
+        return shader == null || shader.name == "Hidden/InternalErrorShader" || ShaderUtil.ShaderHasError(shader);
+    }
+
     private bool ValidateFolderStructure(HashSet<string> dependencies, string requiredRootPath, out string errorMessage)
     {
         errorMessage = "";
+        // Trailing slash so "Assets/Booth/bob" doesn't also match "Assets/Booth/bobby"
+        string requiredPrefix = requiredRootPath.TrimEnd('/') + "/";
         foreach (string dep in dependencies)
         {
-            if (!dep.StartsWith(requiredRootPath))
+            if (!dep.StartsWith(requiredPrefix, System.StringComparison.Ordinal))
             {
                 errorMessage = $"Asset Violation: '{dep}' is located outside your designated root folder.\n\n" +
                                $"All booth assets must be placed strictly inside:\n{requiredRootPath}/\n\n" +
@@ -504,24 +565,79 @@ public class BoothExporterWindow : EditorWindow
     private void CreateLocalBackup(string sourceFilePath, string rawBoothName)
     {
         if (!Directory.Exists(BackupFolderName)) Directory.CreateDirectory(BackupFolderName);
-        DirectoryInfo dirInfo = new DirectoryInfo(BackupFolderName);
-        foreach (FileInfo file in dirInfo.GetFiles()) file.Delete();
+
+        // Keep the newest backups, leaving room for the one about to be written
+        IEnumerable<string> oldBackups = Directory.GetFiles(BackupFolderName, "*.unitypackage")
+            .OrderByDescending(path => File.GetLastWriteTimeUtc(path))
+            .Skip(MaxLocalBackups - 1);
+        foreach (string oldBackup in oldBackups) File.Delete(oldBackup);
 
         string safeBoothName = string.Join("_", rawBoothName.Split(Path.GetInvalidFileNameChars()));
-        string dateString = System.DateTime.Now.ToString("yyyy-MM-dd_HH-mm");
+        string dateString = System.DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
         string backupFilePath = Path.Combine(BackupFolderName, $"{safeBoothName}_{dateString}.unitypackage");
 
         File.Copy(sourceFilePath, backupFilePath, true);
     }
 
-    private BoothDescriptor FindActiveBooth()
+    // Returns the first active booth in hierarchy order. If there are several, the user is told
+    // which one was picked and can cancel (canceled = true, returns null).
+    private BoothDescriptor FindActiveBooth(out bool canceled)
     {
-        BoothDescriptor[] descriptors = FindObjectsOfType<BoothDescriptor>();
-        foreach (var desc in descriptors)
+        canceled = false;
+        List<BoothDescriptor> activeBooths = FindObjectsOfType<BoothDescriptor>()
+            .Where(desc => desc.gameObject.activeInHierarchy)
+            .ToList();
+
+        if (activeBooths.Count == 0) return null;
+
+        activeBooths.Sort((a, b) => CompareHierarchyPaths(GetHierarchyPath(a.transform), GetHierarchyPath(b.transform)));
+        BoothDescriptor selected = activeBooths[0];
+
+        if (activeBooths.Count > 1)
         {
-            if (desc.gameObject.activeInHierarchy) return desc;
+            string others = string.Join("\n", activeBooths.Skip(1).Select(desc => $"- {desc.gameObject.name}"));
+            bool proceed = EditorUtility.DisplayDialog("Multiple Active Booths",
+                $"Found {activeBooths.Count} active booths in the scene. The first one in the hierarchy was selected:\n\n" +
+                $"'{selected.gameObject.name}' ({selected.creatorName} - {selected.boothName})\n\n" +
+                $"Ignored:\n{others}\n\n" +
+                "To use a different booth, disable the others or move it to the top of the hierarchy.",
+                "Continue", "Cancel");
+
+            if (!proceed)
+            {
+                canceled = true;
+                return null;
+            }
         }
-        return null;
+
+        return selected;
+    }
+
+    // Scene index followed by the sibling index of each transform from the root down
+    private static List<int> GetHierarchyPath(Transform transform)
+    {
+        List<int> path = new List<int>();
+        for (Transform current = transform; current != null; current = current.parent)
+        {
+            path.Insert(0, current.GetSiblingIndex());
+        }
+
+        int sceneIndex = 0;
+        for (int i = 0; i < SceneManager.sceneCount; i++)
+        {
+            if (SceneManager.GetSceneAt(i) == transform.gameObject.scene) sceneIndex = i;
+        }
+        path.Insert(0, sceneIndex);
+        return path;
+    }
+
+    private static int CompareHierarchyPaths(List<int> a, List<int> b)
+    {
+        for (int i = 0; i < Mathf.Min(a.Count, b.Count); i++)
+        {
+            if (a[i] != b[i]) return a[i].CompareTo(b[i]);
+        }
+        return a.Count.CompareTo(b.Count);
     }
     
     private void SpawnReferencePrefab()
@@ -665,7 +781,7 @@ public class BoothExporterWindow : EditorWindow
         }
     }
     
-    private async Task CheckForUpdatesAsync()
+    private static string ReadLocalSdkVersion()
     {
         if (File.Exists(PackageJsonPath))
         {
@@ -675,7 +791,7 @@ public class BoothExporterWindow : EditorWindow
                 PackageJsonData pkg = JsonUtility.FromJson<PackageJsonData>(json);
                 if (pkg != null && !string.IsNullOrEmpty(pkg.version))
                 {
-                    localVersionStr = pkg.version;
+                    return pkg.version;
                 }
             }
             catch (System.Exception e)
@@ -683,6 +799,20 @@ public class BoothExporterWindow : EditorWindow
                 Debug.LogWarning($"[Booth SDK] Could not parse local package.json: {e.Message}");
             }
         }
+        return "Unknown";
+    }
+
+    // Accepts "v1.2.3" and "1" as well as "1.2.3"; System.Version needs at least two parts
+    private static bool TryParseSdkVersion(string versionStr, out System.Version version)
+    {
+        string clean = (versionStr ?? "").Replace("v", "").Trim();
+        if (!clean.Contains(".")) clean += ".0";
+        return System.Version.TryParse(clean, out version);
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        localVersionStr = ReadLocalSdkVersion();
 
         using (UnityWebRequest req = UnityWebRequest.Get(GithubLatestReleaseUrl))
         {
@@ -698,10 +828,9 @@ public class BoothExporterWindow : EditorWindow
                     GithubReleaseData release = JsonUtility.FromJson<GithubReleaseData>(req.downloadHandler.text);
                     
                     remoteVersionStr = release.tag_name.Replace("v", "").Trim();
-                    string cleanLocalStr = localVersionStr.Replace("v", "").Trim();
 
-                    if (System.Version.TryParse(cleanLocalStr, out System.Version localVer) && 
-                        System.Version.TryParse(remoteVersionStr, out System.Version remoteVer))
+                    if (TryParseSdkVersion(localVersionStr, out System.Version localVer) &&
+                        TryParseSdkVersion(remoteVersionStr, out System.Version remoteVer))
                     {
                         if (remoteVer > localVer)
                         {
@@ -744,6 +873,8 @@ public class BoothExporterWindow : EditorWindow
 
         using (UnityWebRequest request = UnityWebRequest.Post(ServerEndpoint, form))
         {
+            // Lets the server reject outdated SDKs before receiving the file
+            request.SetRequestHeader("x-sdk-version", ReadLocalSdkVersion());
             var operation = request.SendWebRequest();
             while (!operation.isDone)
             {
@@ -753,8 +884,18 @@ public class BoothExporterWindow : EditorWindow
                 await Task.Delay(100); 
             }
             EditorUtility.ClearProgressBar();
-            if (request.result == UnityWebRequest.Result.Success) EditorUtility.DisplayDialog("Upload Complete", "Upload successful.", "OK");
-            else throw new System.Exception($"Server rejected the upload: {request.error}");
+            if (request.result == UnityWebRequest.Result.Success)
+            {
+                EditorUtility.DisplayDialog("Upload Complete", "Upload successful.", "OK");
+            }
+            else
+            {
+                // The server explains rejections (bad login, outdated SDK, too large) in the response body
+                string serverMessage = request.downloadHandler?.text?.Trim();
+                if (!string.IsNullOrEmpty(serverMessage) && serverMessage.Length > 500) serverMessage = serverMessage.Substring(0, 500) + "...";
+                string details = string.IsNullOrEmpty(serverMessage) ? request.error : $"{serverMessage}\n\n({request.error})";
+                throw new System.Exception($"Server rejected the upload: {details}");
+            }
         }
     }
 
@@ -768,7 +909,8 @@ public class BoothExporterWindow : EditorWindow
             if (dep.EndsWith(".mat") && dep.StartsWith(allowedRootFolder))
             {
                 Material mat = AssetDatabase.LoadAssetAtPath<Material>(dep);
-                if (mat != null)
+                // A broken shader reports HasProperty == false for everything, which would wipe the material
+                if (mat != null && !IsShaderBroken(mat.shader))
                 {
                     SerializedObject so = new SerializedObject(mat);
                     so.Update();
