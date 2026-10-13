@@ -143,7 +143,7 @@ public class BoothAdminDownloader : EditorWindow
                 while (!op.isDone) await Task.Delay(50);
 
                 if (req.result != UnityWebRequest.Result.Success)
-                    throw new System.Exception($"Failed to get booth list: {req.error}");
+                    throw new System.Exception($"Failed to get booth list: {DescribeError(req)}");
 
                 string wrappedJson = "{ \"booths\": " + req.downloadHandler.text + " }";
                 wrapper = JsonUtility.FromJson<BoothListWrapper>(wrappedJson);
@@ -199,7 +199,7 @@ public class BoothAdminDownloader : EditorWindow
                     }
                     else
                     {
-                        Debug.LogError($"[Smart Sync] Failed to download {safeFilename}: {dlReq.error}");
+                        Debug.LogError($"[Smart Sync] Failed to download {safeFilename}: {DescribeError(dlReq)}");
                     }
                 }
             }
@@ -263,6 +263,16 @@ public class BoothAdminDownloader : EditorWindow
 
         // The packages these pointed to were just deleted
         if (File.Exists(PendingImportsPath)) File.Delete(PendingImportsPath);
+    }
+
+    // The server explains failures (wrong login, account locked, rate limited) in the response body
+    private static string DescribeError(UnityWebRequest req)
+    {
+        string serverMessage = null;
+        try { serverMessage = req.downloadHandler?.text?.Trim(); } catch { }
+        if (string.IsNullOrEmpty(serverMessage)) return req.error;
+        if (serverMessage.Length > 300) serverMessage = serverMessage.Substring(0, 300) + "...";
+        return $"{serverMessage} ({req.error})";
     }
 
     // The server only creates [a-zA-Z0-9_-] creator folders and plain .unitypackage names.
@@ -461,7 +471,7 @@ public class BoothAdminDownloader : EditorWindow
 
                 if (req.result != UnityWebRequest.Result.Success)
                 {
-                    throw new System.Exception($"Failed to get booth list: {req.error}\n(Check your admin credentials)");
+                    throw new System.Exception($"Failed to get booth list: {DescribeError(req)}");
                 }
 
                 string jsonResponse = req.downloadHandler.text;
@@ -509,7 +519,7 @@ public class BoothAdminDownloader : EditorWindow
                         }
                         else
                         {
-                            Debug.LogError($"[Booth Admin] Failed to download {safeFilename}: {dlReq.error}");
+                            Debug.LogError($"[Booth Admin] Failed to download {safeFilename}: {DescribeError(dlReq)}");
                         }
                     }
                 }
